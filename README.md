@@ -64,7 +64,8 @@ can show its output.
 
 ```sh
 sh -n .emacs/run-kristal-terminal.sh
-lua-language-server --check=. --check_format=pretty
+lua-language-server --check=. --configpath=.emacs/luarc.json \
+  --check_format=pretty
 ```
 
 The `--check` command may report existing project diagnostics; its purpose here

@@ -58,7 +58,8 @@ sh .emacs/run-kristal-terminal.sh --hold
 
 ```sh
 sh -n .emacs/run-kristal-terminal.sh
-lua-language-server --check=. --check_format=pretty
+lua-language-server --check=. --configpath=.emacs/luarc.json \
+  --check_format=pretty
 ```
 
 `--check` 可能显示项目已有诊断；这里主要用于确认 LuaLS 能读取工作区配置
