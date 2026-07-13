@@ -1,0 +1,73 @@
+{
+    "runtime": {
+        "version": "LuaJIT",
+        "builtin": {
+            "utf8": "enable"
+        },
+        "special": {
+            "love.filesystem.load": "loadfile",
+            "modRequire": "require",
+            "libRequire": "require"
+        }
+    },
+    "workspace": {
+        "library": [
+            "${3rd}/love2d/library",
+            "${env:KRISTAL_LUA_DOCS_LIBRARY}",
+            "${env:KRISTAL_LUA_DOCS}/library",
+            "~/Projects/LuaProjects/kristal-lua-docs/library",
+            ".emacs/kristal-mod-globals.lua",
+            "${env:KRISTAL_ROOT}/main.lua",
+            "${env:KRISTAL_ROOT}/src",
+            "~/Projects/LuaProjects/Kristal/main.lua",
+            "~/Projects/LuaProjects/Kristal/src"
+        ],
+        "checkThirdParty": "Disable",
+        "ignoreDir": [
+            "assets",
+            ".build",
+            "debug",
+            "dist"
+        ]
+    },
+    "completion": {
+        "autoRequire": false
+    },
+    "diagnostics": {
+        "workspaceEvent": "OnChange",
+        "globals": [
+            "love"
+        ],
+        "disable": [
+            "deprecated",
+            "duplicate-set-field",
+            "redundant-parameter",
+            "undefined-doc-name",
+            "return-type-mismatch",
+            "lowercase-global",
+            "need-check-nil",
+            "cast-local-type",
+            "inject-field",
+            "undefined-field"
+        ]
+    },
+    "type": {
+        "weakNilCheck": true,
+        "weakUnionCheck": true,
+        "inferParamType": true
+    },
+    "hint": {
+        "enable": true,
+        "paramType": true,
+        "setType": true,
+        "paramName": "All",
+        "arrayIndex": "Auto",
+        "semicolon": "Disable"
+    },
+    "format": {
+        "defaultConfig": {
+            "indent_style": "space",
+            "indent_size": "4"
+        }
+    }
+}
