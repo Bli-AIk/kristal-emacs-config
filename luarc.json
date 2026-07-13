@@ -17,8 +17,10 @@
             "${env:KRISTAL_LUA_DOCS}/library",
             "~/Projects/LuaProjects/kristal-lua-docs/library",
             ".emacs/kristal-mod-globals.lua",
+            "${env:KRISTAL_ROOT}/luadoc_meta",
             "${env:KRISTAL_ROOT}/main.lua",
             "${env:KRISTAL_ROOT}/src",
+            "~/Projects/LuaProjects/Kristal/luadoc_meta",
             "~/Projects/LuaProjects/Kristal/main.lua",
             "~/Projects/LuaProjects/Kristal/src"
         ],

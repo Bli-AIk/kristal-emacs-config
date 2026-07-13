@@ -39,7 +39,8 @@ path.
 The configuration enables:
 
 - LuaJIT runtime semantics and the Love2D library.
-- Kristal source and generated Lua docs as external libraries.
+- Kristal source, generated Lua docs, and official `luadoc_meta` signatures as
+  external libraries. This includes the generic `Class` constructor signature.
 - Assignment type hints, function parameter type hints, and parameter names.
 - Workspace diagnostics on change and four-space formatting.
 
