@@ -23,6 +23,13 @@ Use FILTER and SENTINEL when they are non-nil."
       (unwind-protect
           (progn
             (process-send-string client "FUMOS/1 AU")
+            (should
+             (fumos-test-wait-until
+              (lambda ()
+                (when-let* ((accepted (fumos-test-server-client server)))
+                  (equal "FUMOS/1 AU"
+                         (process-get accepted 'fumos-input))))))
+            (should-not (fumos-test-server-lines server))
             (process-send-string client "TH secret\nfirst\nsecond\n")
             (should
              (fumos-test-wait-until
@@ -37,9 +44,10 @@ Use FILTER and SENTINEL when they are non-nil."
   (fumos-test-with-server server
     (let (handled received)
       (setf (fumos-test-server-handler server)
-            (lambda (state _client line)
+            (lambda (state client line)
               (setq handled (append handled (list line)))
-              (fumos-test-server-send state (concat "reply:" line "\n"))))
+              (fumos-test-server-send
+               state (concat "reply:" line "\n") client)))
       (let ((client
              (fumos-test-open-network-client
               server "fumos-test-script-client"
@@ -58,21 +66,61 @@ Use FILTER and SENTINEL when they are non-nil."
 
 (ert-deftest fumos-fake-server-can-fragment-output ()
   (fumos-test-with-server server
-    (let (received)
+    (let (received chunks)
       (let ((client
              (fumos-test-open-network-client
               server "fumos-test-fragment-client"
               (lambda (_process chunk)
+                (setq chunks (append chunks (list chunk)))
                 (setq received (concat received chunk))))))
         (unwind-protect
             (progn
               (should
                (fumos-test-wait-until
                 (lambda () (fumos-test-server-client server))))
-              (fumos-test-server-send-chunks server '("alpha\n" "beta\n"))
+              (fumos-test-server-send server "alpha\n")
               (should
                (fumos-test-wait-until
-                (lambda () (equal received "alpha\nbeta\n")))))
+                (lambda () (equal '("alpha\n") chunks))))
+              (fumos-test-server-send server "beta\n")
+              (should
+               (fumos-test-wait-until
+                (lambda ()
+                  (and (equal received "alpha\nbeta\n")
+                       (equal '("alpha\n" "beta\n") chunks))))))
+          (when (process-live-p client)
+            (delete-process client)))))))
+
+(ert-deftest fumos-fake-server-routes-replies-to-originating-client ()
+  (fumos-test-with-server server
+    (let (first-output second-output first second)
+      (setf (fumos-test-server-handler server)
+            (lambda (state client line)
+              (fumos-test-server-send state (concat line "\n") client)))
+      (unwind-protect
+          (progn
+            (setq first
+                  (fumos-test-open-network-client
+                   server "fumos-test-first-client"
+                   (lambda (_process chunk)
+                     (setq first-output (concat first-output chunk)))))
+            (should
+             (fumos-test-wait-until
+              (lambda () (= 1 (length (fumos-test-server-clients server))))))
+            (setq second
+                  (fumos-test-open-network-client
+                   server "fumos-test-second-client"
+                   (lambda (_process chunk)
+                     (setq second-output (concat second-output chunk)))))
+            (should
+             (fumos-test-wait-until
+              (lambda () (= 2 (length (fumos-test-server-clients server))))))
+            (process-send-string first "from-first\n")
+            (should
+             (fumos-test-wait-until
+              (lambda () (equal "from-first\n" first-output))))
+            (should-not second-output))
+        (dolist (client (list first second))
           (when (process-live-p client)
             (delete-process client)))))))
 

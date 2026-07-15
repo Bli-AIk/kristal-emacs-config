@@ -49,9 +49,9 @@
   "Return SERVER's chosen TCP port."
   (process-contact (fumos-test-server-process server) :service))
 
-(defun fumos-test-server-send (server string)
-  "Send STRING to SERVER's current client."
-  (process-send-string (fumos-test-server-client server) string))
+(defun fumos-test-server-send (server string &optional client)
+  "Send STRING to CLIENT, or to SERVER's current client when omitted."
+  (process-send-string (or client (fumos-test-server-client server)) string))
 
 (defun fumos-test-server-send-chunks (server chunks)
   "Send each string in CHUNKS and allow each write to be observed."
