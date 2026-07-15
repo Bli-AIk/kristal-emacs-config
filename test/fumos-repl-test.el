@@ -2452,6 +2452,64 @@
     (should-not linked)
     (should (eq replacement (gethash root fumos-repl--connections)))))
 
+(ert-deftest fumos-bootstrap-deadline-covers-provisional-commit-steps ()
+  (dolist (point '(ui-start source-link))
+    (let* ((fumos-repl--connections (make-hash-table :test #'equal))
+           (root (file-name-as-directory
+                  (file-truename
+                   (fumos-test-make-project-root
+                    (make-temp-file "fumos-bootstrap-deadline-root-" t)))))
+           (server (fumos-test-server-start))
+           (fumos-bootstrap-timeout 0.05)
+           (connection
+            (fumos-repl-connect-instance
+             (fumos-test-instance-for-server server 4242 root)))
+           (replacement
+            (make-fumos-connection
+             :instance (fumos-connection-instance connection)))
+           deadline-fired)
+      (unwind-protect
+          (progn
+            (fumos-repl--handshake-filter
+             connection
+             (fumos-connection-process connection)
+             (fumos-connection-generation connection)
+             fumos-test-golden-ack)
+            (should (eq 'bootstrapping
+                        (fumos-connection-state connection)))
+            (should (timerp (fumos-connection-bootstrap-timer connection)))
+            (cl-labels
+                ((cross-deadline
+                  ()
+                  ;; A nested attach may publish a replacement while an
+                  ;; upstream step yields.  The old timer must close only its
+                  ;; own transport and leave that replacement registered.
+                  (puthash root replacement fumos-repl--connections)
+                  (setq deadline-fired
+                        (fumos-test-wait-until
+                         (lambda ()
+                           (eq 'disconnected
+                               (fumos-connection-state connection)))
+                         0.3))))
+              (cl-letf
+                  (((symbol-function 'fumos-repl--start-upstream-ui)
+                    (lambda (&rest _)
+                      (when (eq point 'ui-start) (cross-deadline))))
+                   ((symbol-function 'fumos-repl--link-project-buffers)
+                    (lambda (&rest _)
+                      (when (eq point 'source-link) (cross-deadline)))))
+                (fumos-repl--finish-bootstrap
+                 connection '(ok "0.6.4" "1.6.1" "LuaJIT 2.1"))))
+            (should deadline-fired)
+            (should (eq 'disconnected
+                        (fumos-connection-state connection)))
+            (should (eq replacement
+                        (gethash root fumos-repl--connections)))
+            (should-not (fumos-connection-bootstrap-timer connection)))
+        (fumos-repl-close connection)
+        (fumos-test-server-stop server)
+        (delete-directory root t)))))
+
 (ert-deftest fumos-project-link-revalidates-after-each-source ()
   (let* ((fumos-repl--connections (make-hash-table :test #'equal))
          (root (fumos-test-make-project-root

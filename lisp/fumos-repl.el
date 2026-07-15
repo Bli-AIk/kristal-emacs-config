@@ -1666,7 +1666,6 @@ error or quit to `fumos-repl-connection-error' after complete cleanup."
        (let ((previous-links
               (copy-sequence (fumos-connection-linked-buffers connection)))
              finished failure)
-         (fumos-repl--cancel-bootstrap-deadline connection)
          (unwind-protect
              (condition-case caught
                  (progn
@@ -1676,10 +1675,14 @@ error or quit to `fumos-repl-connection-error' after complete cleanup."
                    (fumos-repl--link-project-buffers connection)
                    (unless (fumos-repl--bootstrap-commit-owned-p connection)
                      (error "FUMOS bootstrap reservation changed after linking"))
-                   (fumos-repl--set-state connection 'ready)
                    (fumos-repl--refresh-macro-cache connection)
                    (unless (fumos-repl--bootstrap-commit-owned-p connection)
                      (error "FUMOS bootstrap reservation changed during macro refresh"))
+                   ;; The independent deadline covers every provisional step
+                   ;; that can reenter or yield.  Cancellation and the ready
+                   ;; transition are adjacent, non-yielding commit operations.
+                   (fumos-repl--cancel-bootstrap-deadline connection)
+                   (fumos-repl--set-state connection 'ready)
                    (message "FUMOS attached: proto 0.6.4, Fennel %s, %s"
                             fennel-version lua-version)
                    (setq finished t))
