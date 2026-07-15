@@ -69,9 +69,15 @@
                    "fennel-proto-repl.el")
     (assert-pinned-protocol-runtime))
   (require 'fennel-mode)
+  (require 'fennel-proto-repl)
+  (unless (and (stringp fennel-proto-repl--protocol)
+               (string-match-p ":version \\\"0\\.6\\.4\\\""
+                               fennel-proto-repl--protocol))
+    (error "FUMOS requires fennel-proto-repl 0.6.4"))
   (require 'fumos-project)
   (require 'fumos-eglot)
   (require 'fumos-instance)
+  (require 'fumos-repl)
   (fumos-project-install))
 
 (provide 'kristal-emacs-config)
