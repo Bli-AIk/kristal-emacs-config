@@ -12,9 +12,26 @@
   (cl-labels
       ((file-sha256
         (file)
+       (with-temp-buffer
+         (insert-file-contents-literally file)
+         (secure-hash 'sha256 (current-buffer))))
+       (source-defvar-value
+        (file symbol)
         (with-temp-buffer
-          (insert-file-contents-literally file)
-          (secure-hash 'sha256 (current-buffer))))
+          (insert-file-contents file)
+          (goto-char (point-min))
+          (unless (re-search-forward
+                   (format "^(defvar[[:space:]]+%s[[:space:]]+"
+                           (regexp-quote (symbol-name symbol)))
+                   nil t)
+            (error "Pinned vendor does not define %s" symbol))
+          (goto-char (match-beginning 0))
+          (let ((form (read (current-buffer))))
+            (unless (and (eq (car-safe form) 'defvar)
+                         (eq (nth 1 form) symbol)
+                         (stringp (nth 2 form)))
+              (error "Pinned vendor has an invalid %s definition" symbol))
+            (nth 2 form))))
        (loaded-source
         (symbol)
         (when-let* ((loaded (symbol-file symbol 'defun)))
@@ -34,11 +51,25 @@
               (error
                (concat
                 "Loaded %s does not match the pinned FUMOS vendor; "
-                "run doom sync and restart Emacs")
-               feature))))))
+               "run doom sync and restart Emacs")
+              feature)))))
+       (assert-pinned-protocol-runtime
+        ()
+        (when (featurep 'fennel-proto-repl)
+          (let ((expected
+                 (source-defvar-value
+                  (expand-file-name "fennel-proto-repl.el" vendor-dir)
+                  'fennel-proto-repl--protocol)))
+            (unless (and (boundp 'fennel-proto-repl--protocol)
+                         (equal fennel-proto-repl--protocol expected))
+              (error
+               (concat
+                "Loaded fennel-proto-repl bytecode does not match the "
+                "pinned FUMOS vendor; run doom sync and restart Emacs")))))))
     (assert-pinned 'fennel-mode 'fennel-mode "fennel-mode.el")
     (assert-pinned 'fennel-proto-repl 'fennel-proto-repl-mode
-                   "fennel-proto-repl.el"))
+                   "fennel-proto-repl.el")
+    (assert-pinned-protocol-runtime))
   (require 'fennel-mode)
   (require 'fumos-project)
   (require 'fumos-eglot)

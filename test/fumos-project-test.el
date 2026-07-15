@@ -64,7 +64,9 @@
       (fennel-mode)
       (fumos-project-activate)
       (should-not fumos-mode)
-      (should-not (assq 'fumos-mode minor-mode-overriding-map-alist)))))
+      (should-not (assq 'fumos-mode minor-mode-overriding-map-alist))
+      (should-not
+       (local-variable-p 'minor-mode-overriding-map-alist (current-buffer))))))
 
 (ert-deftest fumos-first-open-selects-fennel-mode-and-activates-fumos ()
   (dolist (extension '("fnl" "fnlm"))
@@ -136,6 +138,39 @@
       (should-not (equal 0 status))
       (should (string-match-p "does not match the pinned FUMOS vendor"
                               output)))))
+
+(ert-deftest fumos-project-entry-rejects-stale-preloaded-bytecode ()
+  (fumos-test-with-directory shadow
+    (dolist (file '("fennel-mode.el" "fennel-proto-repl.el"))
+      (copy-file (expand-file-name file
+                                   (expand-file-name "vendor/fennel-mode"
+                                                     fumos-test-root))
+                 (expand-file-name file shadow)))
+    (let ((proto (expand-file-name "fennel-proto-repl.el" shadow))
+          (load-path (cons shadow load-path)))
+      (with-temp-buffer
+        (insert-file-contents proto)
+        (goto-char (point-min))
+        (while (search-forward "0.6.4" nil t)
+          (replace-match "0.6.3" t t))
+        (goto-char (point-max))
+        (insert "\n(defvar fumos-stale-bytecode-marker t)\n")
+        (write-region (point-min) (point-max) proto nil 'silent))
+      (should (byte-compile-file proto))
+      (copy-file
+       (expand-file-name "vendor/fennel-mode/fennel-proto-repl.el"
+                         fumos-test-root)
+       proto t))
+    (pcase-let ((`(,status . ,output)
+                 (fumos-test--run-clean-emacs
+                  "-L" shadow
+                  "-l" (expand-file-name "fennel-mode.el" shadow)
+                  "-l" (expand-file-name "fennel-proto-repl.elc" shadow)
+                  "-l" (expand-file-name "init.el" fumos-test-root))))
+      (should-not (equal 0 status))
+      (should (string-match-p
+               "bytecode does not match the pinned FUMOS vendor"
+               output)))))
 
 (provide 'fumos-project-test)
 ;;; fumos-project-test.el ends here

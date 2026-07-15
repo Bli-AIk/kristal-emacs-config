@@ -19,14 +19,18 @@
   "Enable explicit FUMOS live-development commands."
   :lighter " FUMOS"
   :keymap fumos-mode-map
-  (setq-local
-   minor-mode-overriding-map-alist
-   (let ((others
-          (assq-delete-all
-           'fumos-mode (copy-tree minor-mode-overriding-map-alist))))
-     (if fumos-mode
-         (cons (cons 'fumos-mode fumos-mode-map) others)
-       others)))
+  (if fumos-mode
+      (setq-local
+       minor-mode-overriding-map-alist
+       (cons
+        (cons 'fumos-mode fumos-mode-map)
+        (assq-delete-all
+         'fumos-mode (copy-tree minor-mode-overriding-map-alist))))
+    (when (assq 'fumos-mode minor-mode-overriding-map-alist)
+      (setq-local
+       minor-mode-overriding-map-alist
+       (assq-delete-all
+        'fumos-mode (copy-tree minor-mode-overriding-map-alist)))))
   (unless fumos-mode
     (when (fboundp 'fumos-repl-unlink-current-buffer)
       (fumos-repl-unlink-current-buffer))))
