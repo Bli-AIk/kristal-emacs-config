@@ -71,6 +71,7 @@
   (require 'fennel-mode)
   (require 'fumos-project)
   (require 'fumos-eglot)
+  (require 'fumos-instance)
   (fumos-project-install))
 
 (provide 'kristal-emacs-config)
