@@ -3019,7 +3019,7 @@
       (fumos-test-server-stop server)
       (delete-directory root t))))
 
-(ert-deftest fumos-macro-cache-invalidation-rejects-same-generation-late-values ()
+(ert-deftest fumos-macro-refresh-old-epoch-and-replacement-are-noops ()
   (let* ((fumos-repl--connections (make-hash-table :test #'equal))
          (root (fumos-test-make-project-root
                 (make-temp-file "fumos-macro-invalidate-root-" t)))
@@ -3040,7 +3040,8 @@
                      (2 "[[\"game.macros\" \"stale\"]]")
                      (_ "[[\"game.macros\" \"fresh\"]]")))))))))
          (original-run-at-time (symbol-function 'run-at-time))
-         connection delayed-call delayed-timer old-id new-id)
+         connection delayed-call delayed-timer old-id new-id
+         initial-epoch old-epoch new-epoch)
     (unwind-protect
         (progn
           (setq connection
@@ -3057,6 +3058,8 @@
                (buffer-local-value
                 'fennel-proto-repl--buffer
                 (fumos-connection-process-buffer connection))))
+          (setq initial-epoch
+                (fumos-connection-macro-refresh-epoch connection))
           (cl-letf
               (((symbol-function 'run-at-time)
                 (lambda (delay repeat callback &rest arguments)
@@ -3070,7 +3073,7 @@
                            delay repeat callback arguments)))))
             ;; First invalidation models an earlier refresh whose values arrive
             ;; before its deferred callback is allowed to mutate the cache.
-            (fumos-repl--invalidate-macro-cache connection)
+            (fumos-repl--invalidate-and-refresh-macro-cache connection)
             (should
              (eq (fumos-connection-repl-buffer connection)
                  (buffer-local-value
@@ -3078,15 +3081,21 @@
                   (fumos-connection-process-buffer connection))))
             (should (fumos-test-wait-until (lambda () delayed-call)))
             (setq old-id (fumos-connection-macro-refresh-id connection))
+            (setq old-epoch
+                  (fumos-connection-macro-refresh-epoch connection))
             (should (integerp old-id))
+            (should (> old-epoch initial-epoch))
             (should-not (fumos-connection-macro-cache-valid connection))
             (should (equal '(("game.macros" "baseline"))
                            (fumos-connection-macro-cache connection)))
             ;; Reload invalidation must retire OLD-ID before allocating NEW-ID.
-            (fumos-repl--invalidate-macro-cache connection)
+            (fumos-repl--invalidate-and-refresh-macro-cache connection)
             (setq new-id (fumos-connection-macro-refresh-id connection))
+            (setq new-epoch
+                  (fumos-connection-macro-refresh-epoch connection))
             (should (integerp new-id))
             (should (/= old-id new-id))
+            (should (> new-epoch old-epoch))
             (should
              (fumos-test-wait-until
               (lambda ()
@@ -3104,6 +3113,337 @@
       (when connection (fumos-repl-close connection))
       (fumos-test-server-stop server)
       (delete-directory root t))))
+
+(ert-deftest fumos-macro-refresh-setup-reentry-keeps-newest-request ()
+  (fumos-test-with-ready-connection (connection server)
+    (let ((baseline '(("old.macros" "old")))
+          (original-send
+           (symbol-function 'fennel-proto-repl--send-string))
+          reentered frames wire-lines)
+      (setf (fumos-connection-macro-cache connection) baseline
+            (fumos-connection-macro-cache-valid connection) t
+            (fumos-test-server-handler server)
+            (lambda (state client line)
+              (when (string-match-p "macro-loaded" line)
+                (push line wire-lines)
+                (fumos-test-send-macro-result
+                 state client line
+                 (if (= 1 (length wire-lines))
+                     "[[\"fresh.macros\" \"new\"]]"
+                   "[[\"stale.macros\" \"old\"]]")))))
+      (cl-letf
+          (((symbol-function 'fennel-proto-repl--send-string)
+            (lambda (process frame)
+              (push frame frames)
+              (unless reentered
+                (setq reentered t)
+                (fumos-repl--invalidate-and-refresh-macro-cache connection))
+              (funcall original-send process frame))))
+        (fumos-repl--invalidate-and-refresh-macro-cache connection))
+      (should reentered)
+      (should (= 2 (length frames)))
+      (let* ((inner-frame (car frames))
+             (outer-frame (cadr frames))
+             (inner-id (fumos-test-wire-message-id inner-frame))
+             (outer-id (fumos-test-wire-message-id outer-frame))
+             (repl (fumos-connection-repl-buffer connection)))
+        (should (integerp inner-id))
+        (should (integerp outer-id))
+        (should (/= inner-id outer-id))
+        (should (= inner-id (fumos-connection-macro-refresh-id connection)))
+        (with-current-buffer repl
+          (should (gethash inner-id fennel-proto-repl--message-callbacks))
+          (should-not (gethash outer-id fennel-proto-repl--message-callbacks)))
+        (let ((deliveries (fumos-repl--callback-delivery-table connection)))
+          (should (gethash inner-id deliveries))
+          (should-not (gethash outer-id deliveries))))
+      (should
+       (fumos-test-wait-until
+        (lambda ()
+          (and (= 2 (length wire-lines))
+               (fumos-connection-macro-cache-valid connection)
+               (equal '(("fresh.macros" "new"))
+                      (fumos-connection-macro-cache connection))
+               (fumos-test-command-settled-p connection)))))
+      (should-not (fumos-connection-macro-refresh-pending connection)))))
+
+(defun fumos-test-read-command-request (line)
+  "Parse one FUMOS proto command LINE into its exact plist."
+  (unless (and (stringp line)
+               (> (length line) 1)
+               (eq (aref line 0) ?\{)
+               (eq (aref line (1- (length line))) ?\})
+               (not (string-match-p "[\r\n]" line)))
+    (ert-fail (format "Not one command map line: %S" line)))
+  (let* ((input (concat "(" (substring line 1 -1) ")"))
+         (read-result (read-from-string input))
+         (request (car read-result)))
+    (unless (and (= (cdr read-result) (length input))
+                 (proper-list-p request)
+                 (cl-evenp (length request))
+                 (integerp (plist-get request :id))
+                 (or (plist-member request :reload)
+                     (plist-member request :compile)))
+      (ert-fail (format "Malformed command request: %S" line)))
+    request))
+
+(defun fumos-test-command-request-p (line)
+  "Return non-nil when LINE is a reload or compile command map."
+  (condition-case nil
+      (progn (fumos-test-read-command-request line) t)
+    (error nil)))
+
+(defun fumos-test-command-lines-since (server count)
+  "Return command request lines received by SERVER after COUNT."
+  (seq-filter #'fumos-test-command-request-p
+              (nthcdr count (fumos-test-server-lines server))))
+
+(defun fumos-test-send-command-values (server client line value)
+  "Send one real command values terminal and done for LINE."
+  (let* ((request (fumos-test-read-command-request line))
+         (id (plist-get request :id))
+         (op (if (plist-member request :reload) "reload" "compile")))
+    (fumos-test-server-send
+     server
+     (format
+      (concat "(:id %d :op \"accept\")\n"
+              "(:id %d :op %S :values (%s))\n"
+              "(:id %d :op \"done\")\n")
+      id id op (fumos-repl--quote-string value) id)
+     client)))
+
+(defun fumos-test-send-command-error (server client line)
+  "Send one real command error terminal and done for LINE."
+  (let ((id (fumos-test-wire-message-id line)))
+    (unless (integerp id)
+      (ert-fail (format "Command has no request ID: %S" line)))
+    (fumos-test-server-send
+     server
+     (format
+      (concat "(:id %d :op \"accept\")\n"
+              "(:id %d :op \"error\" :type \"compile\" "
+              ":data \"command failed\" :traceback nil)\n"
+              "(:id %d :op \"done\")\n")
+      id id id)
+     client)))
+
+(defun fumos-test-command-settled-p (connection)
+  "Return non-nil when CONNECTION owns no command delivery resources."
+  (let ((repl (fumos-connection-repl-buffer connection)))
+    (and
+     (with-current-buffer repl
+       (hash-table-empty-p fennel-proto-repl--message-callbacks))
+     (hash-table-empty-p (fumos-repl--callback-delivery-table connection))
+     (null (fumos-connection-callback-timers connection))
+     (null (fumos-connection-terminal-timers connection))
+     (null (fumos-connection-terminal-deliveries connection))
+     (null (fumos-connection-active-request-ids connection)))))
+
+(ert-deftest fumos-proto-command-real-tcp-delivers-and-cleans ()
+  (fumos-test-with-ready-connection (connection server)
+    (let ((before (length (fumos-test-server-lines server))) values errors)
+      (setf
+       (fumos-test-server-handler server)
+       (lambda (state client line)
+         (when (fumos-test-command-request-p line)
+           (if (plist-member (fumos-test-read-command-request line) :reload)
+               (fumos-test-send-command-values state client line "reloaded")
+             (fumos-test-send-command-error state client line)))))
+      (with-current-buffer (fumos-connection-repl-buffer connection)
+        (should
+         (integerp
+          (fumos-repl-send-command
+           :reload "demo.module"
+           (list :values (lambda (result) (setq values result))
+                 :error (lambda (&rest result) (setq errors result))))))
+        (should
+         (integerp
+          (fumos-repl-send-command
+           :compile "(do\n(+ 1 2)\n)"
+           (list :values (lambda (result) (setq values result))
+                 :error (lambda (&rest result) (setq errors result)))))))
+      (should
+       (fumos-test-wait-until
+        (lambda ()
+          (and values errors (fumos-test-command-settled-p connection)))))
+      (should (equal '("reloaded") values))
+      (should (equal '("compile" "command failed" nil) errors))
+      (should (= 2 (length (fumos-test-command-lines-since server before)))))))
+
+(ert-deftest fumos-proto-command-formatter-and-send-exits-roll-back ()
+  (fumos-test-with-ready-connection (connection server)
+    (let ((original-format
+           (symbol-function 'fennel-proto-repl--format-message))
+          (original-send
+           (symbol-function 'fennel-proto-repl--send-string)))
+      (with-current-buffer (fumos-connection-repl-buffer connection)
+        (dolist (point '(formatter send))
+          (dolist (kind '(error quit throw))
+            (let ((before (length (fumos-test-server-lines server))) outcome)
+              (cl-labels
+                  ((injected-exit
+                    ()
+                    (pcase kind
+                      ('error (error "command injection"))
+                      ('quit (signal 'quit '("command injection")))
+                      ('throw (throw 'fumos-command-exit :thrown)))))
+                (cl-letf
+                    (((symbol-function 'fennel-proto-repl--format-message)
+                      (if (eq point 'formatter)
+                          (lambda (&rest _) (injected-exit))
+                        original-format))
+                     ((symbol-function 'fennel-proto-repl--send-string)
+                      (if (eq point 'send)
+                          (lambda (&rest _) (injected-exit))
+                        original-send)))
+                  (setq
+                   outcome
+                   (pcase kind
+                     ('error
+                      (condition-case caught
+                          (fumos-repl-send-command
+                           :reload "demo" (list :values #'ignore))
+                        (error caught)))
+                     ('quit
+                      (condition-case caught
+                          (fumos-repl-send-command
+                           :reload "demo" (list :values #'ignore))
+                        (quit caught)))
+                     ('throw
+                      (catch 'fumos-command-exit
+                        (fumos-repl-send-command
+                         :reload "demo" (list :values #'ignore))
+                        :not-thrown))))))
+              (ert-info ((format "point=%S kind=%S outcome=%S"
+                                 point kind outcome))
+                (should (eq (pcase kind
+                              ((or 'error 'quit) kind)
+                              ('throw :thrown))
+                            (if (consp outcome) (car outcome) outcome))))
+              (should (= before (length (fumos-test-server-lines server))))
+              (should (fumos-test-command-settled-p connection)))))))))
+
+(ert-deftest fumos-proto-command-rejects-zero-id-and-rolls-back ()
+  (fumos-test-with-ready-connection (connection server)
+    (let ((before (length (fumos-test-server-lines server))))
+      (with-current-buffer (fumos-connection-repl-buffer connection)
+        ;; Zero belongs to the bootstrap request and is never a user command ID.
+        (setq fennel-proto-repl--message-id 0)
+        (should-error
+         (fumos-repl-send-command
+          :reload "demo.module" (list :values #'ignore))
+         :type 'user-error))
+      (should (= before (length (fumos-test-server-lines server))))
+      (should (fumos-test-command-settled-p connection)))))
+
+(ert-deftest fumos-proto-command-rejects-disconnected-and-oversize-utf8 ()
+  (fumos-test-with-ready-connection (connection server)
+    (let ((repl (fumos-connection-repl-buffer connection))
+          (before (length (fumos-test-server-lines server))))
+      (with-current-buffer repl
+        (let ((state (fumos-connection-state connection)))
+          (setf (fumos-connection-state connection) 'disconnected)
+          (unwind-protect
+              (should-error
+               (fumos-repl-send-command
+                :reload "demo" (list :values #'ignore))
+               :type 'user-error)
+            (setf (fumos-connection-state connection) state)))
+        (let ((dead (make-pipe-process
+                     :name "fumos-command-dead" :noquery t)))
+          (delete-process dead)
+          (let ((fumos-repl--connection
+                 (make-fumos-connection
+                  :state 'ready :process dead :repl-buffer repl)))
+            (should-error
+             (fumos-repl-send-command
+              :reload "demo" (list :values #'ignore))
+             :type 'user-error)))
+        (let ((data (make-string 2796203 ?中)) sent)
+          (should (< (length data) fumos-repl--max-message-bytes))
+          (cl-letf (((symbol-function 'fennel-proto-repl--send-string)
+                     (lambda (&rest _) (setq sent t))))
+            (should-error
+             (fumos-repl-send-command
+              :compile data (list :values #'ignore))
+             :type 'user-error))
+          (should-not sent)))
+      (should (= before (length (fumos-test-server-lines server))))
+      (should (fumos-test-command-settled-p connection)))))
+
+(ert-deftest fumos-macro-refresh-failure-keeps-stale-cache ()
+  (fumos-test-with-ready-connection (connection server)
+    (let ((baseline '(("old.macros" "still-visible")))
+          (mode 'error))
+      (setf (fumos-connection-macro-cache connection) baseline
+            (fumos-connection-macro-cache-valid connection) t)
+      (setf
+       (fumos-test-server-handler server)
+       (lambda (state client line)
+         (when (string-match-p "macro-loaded" line)
+           (pcase mode
+             ('error (fumos-test-send-command-error state client line))
+             ('malformed
+              (fumos-test-send-macro-result
+               state client line "[\"not-an-entry\"]"))))))
+      (fumos-repl--invalidate-and-refresh-macro-cache connection)
+      (should
+       (fumos-test-wait-until
+        (lambda ()
+          (not (fumos-connection-macro-refresh-pending connection)))))
+      (should-not (fumos-connection-macro-cache-valid connection))
+      (should (equal baseline (fumos-connection-macro-cache connection)))
+      (setq mode 'malformed)
+      (with-current-buffer (fumos-connection-repl-buffer connection)
+        (should (equal baseline (fumos-repl--obtain-macros connection))))
+      (should
+       (fumos-test-wait-until
+        (lambda ()
+          (not (fumos-connection-macro-refresh-pending connection)))))
+      (should-not (fumos-connection-macro-cache-valid connection))
+      (should (equal baseline (fumos-connection-macro-cache connection)))
+      (dolist (point '(formatter send))
+        (dolist (kind '(error quit throw))
+          (let ((original-format
+                 (symbol-function 'fumos-repl--format-eval-request))
+                (original-send
+                 (symbol-function 'fennel-proto-repl--send-string))
+                outcome)
+            (cl-labels
+                ((injected-exit
+                  ()
+                  (pcase kind
+                    ('error (error "macro refresh injection"))
+                    ('quit (signal 'quit nil))
+                    ('throw (throw 'fumos-macro-refresh-exit :thrown)))))
+              (cl-letf
+                  (((symbol-function 'fumos-repl--format-eval-request)
+                    (if (eq point 'formatter)
+                        (lambda (&rest _) (injected-exit))
+                      original-format))
+                   ((symbol-function 'fennel-proto-repl--send-string)
+                    (if (eq point 'send)
+                        (lambda (&rest _) (injected-exit))
+                      original-send)))
+                (setq outcome
+                      (if (eq kind 'throw)
+                          (catch 'fumos-macro-refresh-exit
+                            (fumos-repl--invalidate-and-refresh-macro-cache
+                             connection)
+                            :not-thrown)
+                        (condition-case nil
+                            (progn
+                              (fumos-repl--invalidate-and-refresh-macro-cache
+                               connection)
+                              nil)
+                          ((error quit) :escaped))))))
+            (should (eq (if (eq kind 'throw) :thrown nil) outcome))
+            (should-not
+             (fumos-connection-macro-refresh-pending connection))
+            (should-not (fumos-connection-macro-cache-valid connection))
+            (should (equal baseline
+                           (fumos-connection-macro-cache connection))))))
+      (should (process-live-p (fumos-connection-process connection))))))
 
 (ert-deftest fumos-macro-cache-commit-refreshes-owned-source-font-lock ()
   (let* ((fumos-repl--connections (make-hash-table :test #'equal))
@@ -3166,7 +3506,7 @@
               ((symbol-function 'fumos-repl--refresh-linked-font-lock)
                (lambda (&rest _) (setq refreshed t))))
       (fumos-repl--complete-macro-refresh
-       connection nil 3 nil 9 '("[\"bad-entry\"]")))
+       connection nil 3 nil 1 9 'callback '("[\"bad-entry\"]")))
     (should-not refreshed)
     (should-not (fumos-connection-macro-cache-valid connection))
     (should (equal '(("old.pkg" "old-macro"))

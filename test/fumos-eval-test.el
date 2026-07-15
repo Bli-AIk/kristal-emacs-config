@@ -818,5 +818,1036 @@
       (dolist (function '(save-buffer basic-save-buffer write-region))
         (should-not (fumos-test-advice-contains-fumos-p function))))))
 
+(defun fumos-test-send-eval-runtime-error
+    (server client line message &optional type)
+  "Send a real eval error MESSAGE and done for request LINE."
+  (let* ((request (fumos-test-read-eval-request line))
+         (id (plist-get request :id)))
+    (fumos-test-server-send
+     server
+     (format
+      (concat "(:id %d :op \"accept\")\n"
+              "(:id %d :op \"error\" :type %S :data %S :traceback nil)\n"
+              "(:id %d :op \"done\")\n")
+      id id (or type "runtime") message id)
+     client)))
+
+(defun fumos-test-send-compile-error (server client line message)
+  "Send a real compile error MESSAGE and done for command LINE."
+  (let* ((request (fumos-test-read-command-request line))
+         (id (plist-get request :id)))
+    (fumos-test-server-send
+     server
+     (format
+      (concat "(:id %d :op \"accept\")\n"
+              "(:id %d :op \"error\" :type \"compile\" "
+              ":data %S :traceback nil)\n"
+              "(:id %d :op \"done\")\n")
+      id id message id)
+     client)))
+
+(defun fumos-test-reload-eval-line-p (line)
+  "Return non-nil when LINE is a semantic source reload request."
+  (and (fumos-test-eval-request-p line)
+       (string-match-p
+        (regexp-quote "_G.Mod.libs.fumos.reload")
+        (plist-get (fumos-test-read-eval-request line) :eval))))
+
+(ert-deftest fumos-reload-current-file-uses-attached-canonical-source ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (let ((paths '("mod.fnl"
+                   "scripts/waves/spiral.fnl"
+                   "fnl/combat/math.fnl"
+                   "fnl/combat/macros.fnlm"))
+          reload-lines)
+      (setf
+       (fumos-test-server-handler server)
+       (lambda (state client line)
+         (cond
+          ((and (fumos-test-eval-request-p line)
+                (string-match-p "macro-loaded" line))
+           (fumos-test-send-eval-values state client line "nil"))
+          ((fumos-test-reload-eval-line-p line)
+           (push line reload-lines)
+           (fumos-test-send-eval-values state client line "true")))))
+      (dolist (relative paths)
+        (let ((absolute (expand-file-name relative root)))
+          (make-directory (file-name-directory absolute) t)
+          (with-temp-file absolute (insert "; saved\n"))
+          (setq buffer-file-name absolute)
+          (set-buffer-modified-p nil)
+          (let ((before (length reload-lines)))
+            (should (integerp (fumos-reload-current-file)))
+            (should
+             (fumos-test-wait-until
+              (lambda ()
+                (and (= (1+ before) (length reload-lines))
+                     (fumos-connection-macro-cache-valid connection)))))
+            (let* ((request
+                    (fumos-test-read-eval-request (car reload-lines)))
+                   (code (plist-get request :eval))
+                   (guard
+                    (string-match
+                     (regexp-quote
+                      "(assert (= _G _G._G) \"FUMOS tooling requires unshadowed _G\")")
+                     code))
+                   (call
+                    (string-match
+                     (regexp-quote "(_G.Mod.libs.fumos.reload") code)))
+              (should (integerp guard))
+              (should (integerp call))
+              (should (< guard call))
+              (should
+               (string-match-p
+                (regexp-quote (format "{:path %S}" relative)) code))
+              (should-not (string-match-p "([^_]Mod\\.libs" code))
+              (should
+               (equal (concat "mods/demo/" relative)
+                      (plist-get request :file)))))))
+      (should (= (length paths) (length reload-lines))))))
+
+(ert-deftest fumos-reload-rejects-unsaved-unsupported-and-shadowed-global ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (erase-buffer)
+    (insert "(local Mod {})\n(local Kristal {})\n(local _G {})\n")
+    (let* ((outside (make-temp-file "fumos-reload-outside-" nil ".fnl"))
+           (escape (expand-file-name "scripts/escape.fnl" root))
+           (original-file file)
+           (before (length (fumos-test-server-lines server)))
+           guard-line)
+      (unwind-protect
+          (progn
+            (make-symbolic-link outside escape)
+            (set-buffer-modified-p t)
+            (cl-letf (((symbol-function 'save-buffer)
+                       (lambda (&rest _)
+                         (ert-fail "reload implicitly saved the source"))))
+              (should-error (fumos-reload-current-file) :type 'user-error))
+            (set-buffer-modified-p nil)
+            (dolist (candidate
+                     (list nil
+                           outside
+                           "/ssh:fumos@example.invalid:/tmp/source.fnl"
+                           escape
+                           (expand-file-name "scripts/not-fennel.lua" root)
+                           (expand-file-name "scripts/not-supported.fnlm" root)))
+              (setq buffer-file-name candidate)
+              (should-error (fumos-reload-current-file) :type 'user-error))
+            (should (= before (length (fumos-test-server-lines server))))
+            (setq buffer-file-name original-file)
+            (setf
+             (fumos-test-server-handler server)
+             (lambda (state client line)
+               (when (fumos-test-reload-eval-line-p line)
+                 (setq guard-line line)
+                 (fumos-test-send-eval-runtime-error
+                  state client line
+                  "FUMOS tooling requires unshadowed _G"))))
+            (should (integerp (fumos-reload-current-file)))
+            (should (fumos-test-wait-until (lambda () guard-line)))
+            (let* ((code
+                    (plist-get
+                     (fumos-test-read-eval-request guard-line) :eval))
+                   (guard (string-match "(assert (= _G _G\\._G)" code))
+                   (side-effect
+                    (string-match "(_G\\.Mod\\.libs\\.fumos\\.reload" code)))
+              (should (integerp guard))
+              (should (integerp side-effect))
+              (should (< guard side-effect))
+              (should-not (string-match-p "(Kristal\\.quickReload" code))))
+        (setq buffer-file-name original-file)
+        (set-buffer-modified-p nil)
+        (when (file-exists-p outside) (delete-file outside))))))
+
+(ert-deftest fumos-reload-remote-source-fails-before-project-discovery ()
+  (with-temp-buffer
+    (setq buffer-file-name
+          "/ssh:fumos@example.invalid:/tmp/scripts/remote.fnl"
+          default-directory "/ssh:fumos@example.invalid:/tmp/")
+    (set-buffer-modified-p nil)
+    (let ((fumos-repl--connection nil))
+      (cl-letf (((symbol-function 'fumos-project-root)
+                 (lambda (&rest _)
+                   (ert-fail "Remote reload attempted project discovery"))))
+        (should-error (fumos-reload-current-file) :type 'user-error)))))
+
+(ert-deftest fumos-reload-success-invalidates-macro-cache-and-refreshes ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (erase-buffer)
+    (insert "(+ 1 2)\n")
+    (set-buffer-modified-p nil)
+    (let ((baseline '(("old.macros" "old")))
+          (mode 'source-success)
+          (refreshes 0)
+          initial-epoch)
+      (setf (fumos-connection-macro-cache connection) baseline
+            (fumos-connection-macro-cache-valid connection) t)
+      (setq initial-epoch
+            (fumos-connection-macro-refresh-epoch connection))
+      (setf
+       (fumos-test-server-handler server)
+       (lambda (state client line)
+         (cond
+          ((and (fumos-test-eval-request-p line)
+                (string-match-p "macro-loaded" line))
+           (cl-incf refreshes)
+           (fumos-test-send-eval-values
+            state client line "[[\"fresh.macros\" \"new\"]]"))
+          ((fumos-test-reload-eval-line-p line)
+           (pcase mode
+             ('source-success
+              (fumos-test-send-eval-values state client line "true"))
+             ('failure-report
+              (fumos-test-server-send
+               state
+               (let* ((request (fumos-test-read-eval-request line))
+                      (id (plist-get request :id)))
+                 (format
+                  (concat "(:id %d :op \"accept\")\n"
+                          "(:id %d :op \"eval\" :values "
+                          "(\"false\" \"report\"))\n"
+                          "(:id %d :op \"done\")\n")
+                  id id id))
+               client))
+             ('error
+              (fumos-test-send-eval-runtime-error
+               state client line "reload failed"))))
+          ((fumos-test-command-request-p line)
+           (fumos-test-send-command-values state client line "module")))))
+      (should (integerp (fumos-reload-current-file)))
+      (should
+       (fumos-test-wait-until
+        (lambda ()
+          (and (= 1 refreshes)
+               (fumos-connection-macro-cache-valid connection)
+               (equal '(("fresh.macros" "new"))
+                      (fumos-connection-macro-cache connection))))))
+      (should (> (fumos-connection-macro-refresh-epoch connection)
+                 initial-epoch))
+      (setf (fumos-connection-macro-cache connection) baseline
+            (fumos-connection-macro-cache-valid connection) t)
+      (let ((before-epoch
+             (fumos-connection-macro-refresh-epoch connection)))
+        (setq mode 'failure-report)
+        (should (integerp (fumos-reload-current-file)))
+        (fumos-test-assert-eval-settled connection)
+        (should (= before-epoch
+                   (fumos-connection-macro-refresh-epoch connection)))
+        (should (fumos-connection-macro-cache-valid connection))
+        (should (equal baseline (fumos-connection-macro-cache connection))))
+      (let ((before-epoch
+             (fumos-connection-macro-refresh-epoch connection)))
+        (setq mode 'error)
+        (should (integerp (fumos-reload-current-file)))
+        (fumos-test-assert-eval-settled connection)
+        (should (= before-epoch
+                   (fumos-connection-macro-refresh-epoch connection))))
+      (setq mode 'module-success)
+      (setf (fumos-connection-macro-cache connection) baseline
+            (fumos-connection-macro-cache-valid connection) t)
+      (let ((before refreshes))
+        (should (integerp (fumos-reload-module "demo.module")))
+        (should
+         (fumos-test-wait-until
+          (lambda ()
+            (and (= (1+ before) refreshes)
+                 (fumos-connection-macro-cache-valid connection))))))))
+  ;; A transport loss is not a successful reload and starts no refresh.
+  (fumos-test-with-fennel-file (root file connection server)
+    (let ((refreshes 0)
+          (epoch (fumos-connection-macro-refresh-epoch connection)))
+      (set-buffer-modified-p nil)
+      (setf
+       (fumos-test-server-handler server)
+       (lambda (state _client line)
+         (cond
+          ((string-match-p "macro-loaded" line) (cl-incf refreshes))
+          ((fumos-test-reload-eval-line-p line)
+           (fumos-test-server-drop-client state)))))
+      (fumos-reload-current-file)
+      (should
+       (fumos-test-wait-until
+        (lambda () (eq 'disconnected (fumos-connection-state connection)))))
+      (should (= 0 refreshes))
+      (should (> (fumos-connection-macro-refresh-epoch connection) epoch))
+      (should-not (fumos-connection-macro-refresh-pending connection)))))
+
+(ert-deftest fumos-compile-buffer-is-one-do-unit-with-no-trailing-eval ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (erase-buffer)
+    (insert (concat "(macro twice [x] `(+ ,x ,x))\n"
+                    "(set _G.fumos_compile_first true)\n"
+                    "(set _G.fumos_compile_second (twice 2))"))
+    (let ((source (buffer-string))
+          (before (length (fumos-test-server-lines server))))
+      (setf
+       (fumos-test-server-handler server)
+       (lambda (state client line)
+         (when (fumos-test-command-request-p line)
+           (fumos-test-send-command-values
+            state client line
+            "fumos_compile_first = true\nfumos_compile_second = (2 + 2)"))))
+      (should (integerp (fumos-compile-buffer)))
+      (should
+       (fumos-test-wait-until
+        (lambda ()
+          (and (= 1 (length (fumos-test-command-lines-since server before)))
+               (fumos-test-eval-settled-p connection)))))
+      (let* ((commands (fumos-test-command-lines-since server before))
+             (request (fumos-test-read-command-request (car commands))))
+        (should (= 1 (length commands)))
+        (should (plist-member request :compile))
+        (should (equal (concat "(do\n" source "\n)")
+                       (plist-get request :compile))))
+      (should-not (fumos-test-eval-lines-since server before))
+      (when-let* ((buffer (get-buffer "*FUMOS Lua*")))
+        (kill-buffer buffer)))))
+
+(ert-deftest fumos-compile-buffer-real-result-shows-complete-lua ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (erase-buffer)
+    (insert "(do (set _G.first true) (set _G.second (+ 2 2)))")
+    (let ((lua (concat "_G.first = true\n"
+                       "_G.second = (2 + 2)\n"
+                       "return _G.second")))
+      (unwind-protect
+          (progn
+            (setf
+             (fumos-test-server-handler server)
+             (lambda (state client line)
+               (when (fumos-test-command-request-p line)
+                 (fumos-test-send-command-values state client line lua))))
+            (fumos-compile-buffer)
+            (should
+             (fumos-test-wait-until
+              (lambda ()
+                (and (get-buffer "*FUMOS Lua*")
+                     (fumos-test-eval-settled-p connection)))))
+            (with-current-buffer "*FUMOS Lua*"
+              (should (equal (concat lua "\n") (buffer-string)))
+              (should buffer-read-only)
+              (should (eq major-mode 'prog-mode))))
+        (when-let* ((buffer (get-buffer "*FUMOS Lua*")))
+          (kill-buffer buffer))))))
+
+(ert-deftest fumos-compile-error-remaps-pinned-session-locus ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (erase-buffer)
+    (insert "(bad-first)\n(bad-second)\n\t中文(bad-third)\n")
+    (let ((responses
+           '("Error compiling expression: unknown:3:0: first"
+             "Error compiling expression: unknown:4:0: second"
+             "Error compiling expression: unknown:5:3: unicode"
+             "Compile error: unknown:3:0: hostile-prefix"
+             "Error compiling expression: unknown:2:0: wrapper"))
+          received)
+      (setf
+       (fumos-test-server-handler server)
+       (lambda (state client line)
+         (when (fumos-test-command-request-p line)
+           (fumos-test-send-compile-error
+            state client line (pop responses)))))
+      (cl-letf
+          (((symbol-function 'fumos-repl--default-error-handler)
+            (lambda (type message traceback)
+              (should-not compilation-error-screen-columns)
+              (push (list type message traceback) received))))
+        (dolist (expected
+                 '("Error compiling expression: mods/demo/scripts/foo.fnl:1:1: first"
+                   "Error compiling expression: mods/demo/scripts/foo.fnl:2:1: second"
+                   "Error compiling expression: mods/demo/scripts/foo.fnl:3:4: unicode"
+                   "Compile error: unknown:3:0: hostile-prefix"
+                   "Error compiling expression: unknown:2:0: wrapper"))
+          (let ((before (length received)))
+            (fumos-compile-buffer)
+            (should
+             (fumos-test-wait-until
+              (lambda () (= (1+ before) (length received)))))
+            (should (equal expected (cadar received)))))
+        (let ((original-file buffer-file-name)
+              (before (length received)))
+          (setq buffer-file-name nil)
+          (setf
+           (fumos-test-server-handler server)
+           (lambda (state client line)
+             (when (fumos-test-command-request-p line)
+               (fumos-test-send-compile-error
+                state client line
+                "Error compiling expression: unknown:3:0: no-source"))))
+          (fumos-compile-buffer)
+          (should
+           (fumos-test-wait-until
+            (lambda () (= (1+ before) (length received)))))
+          (should
+           (equal "Error compiling expression: unknown:3:0: no-source"
+                  (cadar received)))
+          (setq buffer-file-name original-file))
+        (erase-buffer)
+        (insert "; prefix\n\t中文(bad-offset)\n")
+        (goto-char (point-min))
+        (search-forward "(bad-offset)")
+        (backward-char (length "(bad-offset)"))
+        (let ((before (length received)))
+          (setf
+           (fumos-test-server-handler server)
+           (lambda (state client line)
+             (when (fumos-test-command-request-p line)
+               (fumos-test-send-compile-error
+                state client line
+                "Error compiling expression: unknown:3:0: offset"))))
+          (fumos-compile-defun)
+          (should
+           (fumos-test-wait-until
+            (lambda () (= (1+ before) (length received)))))
+          (should
+           (equal
+            "Error compiling expression: mods/demo/scripts/foo.fnl:2:4: offset"
+            (cadar received))))
+        (let* ((source (fumos-eval--source (point-min)))
+               (callback
+                (fumos-eval--compile-error-callback
+                 connection (fumos-connection-process connection)
+                 (1- (fumos-connection-generation connection))
+                 source 1 1))
+               stale)
+          (cl-letf (((symbol-function 'fumos-repl--default-error-handler)
+                     (lambda (_type message _traceback)
+                       (setq stale message))))
+            (funcall callback
+                     "compile"
+                     "Error compiling expression: unknown:3:0: stale"
+                     nil))
+          (should
+           (equal "Error compiling expression: unknown:3:0: stale" stale)))))))
+
+(ert-deftest fumos-compile-request-counts-wrapper-overhead-at-8mib ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (let ((base "; quote=\" slash=\\ cr=\r\n; 中文\n")
+          (repl (fumos-connection-repl-buffer connection))
+          captured)
+      (cl-labels
+          ((wire
+            (id source)
+            (string-replace
+             "\r" "\\r"
+             (fennel-proto-repl--format-message
+              id :compile (concat "(do\n" source "\n)") t)))
+           (exact-source
+            (id)
+            (let* ((base-bytes (fumos-repl--utf8-bytes (wire id base)))
+                   (padding (- fumos-repl--max-message-bytes base-bytes)))
+              (should (> padding 0))
+              (concat base (make-string padding ?x)))))
+        (let* ((id (buffer-local-value
+                    'fennel-proto-repl--message-id repl))
+               (source (exact-source id)))
+          (erase-buffer)
+          (insert source)
+          (should
+           (= fumos-repl--max-message-bytes
+              (fumos-repl--utf8-bytes (wire id source))))
+          (cl-letf (((symbol-function 'fennel-proto-repl--send-string)
+                     (lambda (_process frame) (setq captured frame))))
+            (should (integerp (fumos-compile-buffer))))
+          (should (= fumos-repl--max-message-bytes
+                     (fumos-repl--utf8-bytes captured)))
+          (should
+           (equal (concat "(do\n" source "\n)")
+                  (plist-get
+                   (fumos-test-read-command-request captured) :compile)))
+          (fumos-test-send-command-values
+           server (fumos-test-server-client server) captured "return true")
+          (fumos-test-assert-eval-settled connection))
+        (let* ((id (buffer-local-value
+                    'fennel-proto-repl--message-id repl))
+               (source (concat (exact-source id) "x"))
+               sent)
+          (erase-buffer)
+          (insert source)
+          (should (> (fumos-repl--utf8-bytes (wire id source))
+                     fumos-repl--max-message-bytes))
+          (cl-letf (((symbol-function 'fennel-proto-repl--send-string)
+                     (lambda (&rest _) (setq sent t))))
+            (should-error (fumos-compile-buffer) :type 'user-error))
+          (should-not sent)
+          (fumos-test-assert-eval-settled connection)))
+      (when-let* ((buffer (get-buffer "*FUMOS Lua*")))
+        (kill-buffer buffer)))))
+
+(ert-deftest fumos-compile-never-saves-or-runs-source ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (erase-buffer)
+    (insert "(set _G.must_not_run true)\n")
+    (set-buffer-modified-p t)
+    (let ((before (length (fumos-test-server-lines server))))
+      (setf
+       (fumos-test-server-handler server)
+       (lambda (state client line)
+         (when (fumos-test-command-request-p line)
+           (fumos-test-send-command-values
+            state client line "_G.must_not_run = true"))))
+      (cl-letf (((symbol-function 'save-buffer)
+                 (lambda (&rest _) (ert-fail "compile saved source")))
+                ((symbol-function 'fumos-reload-current-file)
+                 (lambda (&rest _) (ert-fail "compile reloaded source")))
+                ((symbol-function 'fumos-repl-send-eval)
+                 (lambda (&rest _) (ert-fail "compile evaluated source"))))
+        (should (integerp (fumos-compile-buffer))))
+      (should
+       (fumos-test-wait-until
+        (lambda () (fumos-test-eval-settled-p connection))))
+      (should (buffer-modified-p))
+      (should (equal "" (with-temp-buffer
+                           (insert-file-contents file)
+                           (buffer-string))))
+      (should (= 1 (length (fumos-test-command-lines-since server before))))
+      (should-not (fumos-test-eval-lines-since server before))
+      (cl-letf (((symbol-function 'fumos-repl-send-command)
+                 (lambda (&rest _) (ert-fail "save compiled source"))))
+        (save-buffer))
+      (should-not (buffer-modified-p))
+      (should
+       (equal "(set _G.must_not_run true)\n"
+              (with-temp-buffer
+                (insert-file-contents file)
+                (buffer-string))))
+      (when-let* ((buffer (get-buffer "*FUMOS Lua*")))
+        (kill-buffer buffer)))))
+
+(defun fumos-test-process-attributes-at (start)
+  "Return a minimal current-user process attribute set for START."
+  `((euid . ,(user-uid)) (start . ,start)))
+
+(defun fumos-test-game-connection (root token &optional pid)
+  "Return a token-redacted game reload connection rooted at ROOT."
+  (make-fumos-connection
+   :instance
+   (make-fumos-instance
+    :project-root (file-name-as-directory (file-truename root))
+    :mod-id "demo" :pid (or pid 4242) :token token)
+   :state 'ready :generation 7 :game-reload-generation 0))
+
+(ert-deftest fumos-game-reload-public-modes-use-guarded-global ()
+  (fumos-test-with-ready-connection (connection server)
+    (let ((start (current-time))
+          (original-run-at-time (symbol-function 'run-at-time))
+          lines timers)
+      (setf
+       (fumos-test-server-handler server)
+       (lambda (state client line)
+         (when (fumos-test-eval-request-p line)
+           (push line lines)
+           (fumos-test-send-eval-values state client line "true"))))
+      (cl-letf
+          (((symbol-function 'process-attributes)
+            (lambda (_pid) (fumos-test-process-attributes-at start)))
+           ((symbol-function 'run-at-time)
+            (lambda (delay repeat callback &rest arguments)
+              (if (and (equal delay 0.1) (equal repeat 0.1))
+                  (let ((timer
+                         (funcall original-run-at-time 3600 nil callback)))
+                    (push timer timers)
+                    timer)
+                (apply original-run-at-time
+                       delay repeat callback arguments)))))
+        (dolist (case '((fumos-reload-game-preserve . "temp")
+                        (fumos-reload-game-save . "save")
+                        (fumos-reload-game-from-start . "none")))
+          (let ((before (length lines)))
+            (should
+             (integerp
+              (with-current-buffer
+                  (fumos-connection-repl-buffer connection)
+                (funcall (car case)))))
+            (should
+             (fumos-test-wait-until
+              (lambda ()
+                (and (= (1+ before) (length lines))
+                     (fumos-test-eval-settled-p connection)))))
+            (let* ((request (fumos-test-read-eval-request (car lines)))
+                   (code (plist-get request :eval)))
+              (should
+               (equal
+                (format
+                 (concat "(do\n"
+                         "  (assert (= _G _G._G) "
+                         "\"FUMOS tooling requires unshadowed _G\")\n"
+                         "  (_G.Kristal.quickReload %S))")
+                 (cdr case))
+                code))
+              (should-not (string-match-p "([^_]Kristal\\." code)))
+              (should (equal (cdr case)
+                             (fumos-connection-pending-game-reload
+                              connection)))
+            (fumos-repl--cancel-game-reload-timer connection))))
+      (should (= 3 (length lines)))
+      (dolist (timer timers) (fumos-repl--cancel-timer timer)))))
+
+(ert-deftest fumos-game-reload-rejects-concurrent-intent ()
+  (fumos-test-with-ready-connection (connection server)
+    (let ((start (current-time))
+          (original-run-at-time (symbol-function 'run-at-time))
+          first-timer)
+      (setf
+       (fumos-test-server-handler server)
+       (lambda (state client line)
+         (when (fumos-test-eval-request-p line)
+           (fumos-test-send-eval-values state client line "true"))))
+      (cl-letf
+          (((symbol-function 'process-attributes)
+            (lambda (_pid) (fumos-test-process-attributes-at start)))
+           ((symbol-function 'run-at-time)
+            (lambda (delay repeat callback &rest arguments)
+              (if (and (equal delay 0.1) (equal repeat 0.1))
+                  (setq first-timer
+                        (funcall original-run-at-time 3600 nil callback))
+                (apply original-run-at-time
+                       delay repeat callback arguments)))))
+        (with-current-buffer (fumos-connection-repl-buffer connection)
+          (fumos-reload-game-preserve))
+        (should first-timer)
+        (let ((before (length (fumos-test-server-lines server)))
+              (generation
+               (fumos-connection-game-reload-generation connection)))
+          (should-error
+           (with-current-buffer (fumos-connection-repl-buffer connection)
+             (fumos-reload-game-save))
+           :type 'user-error)
+          (should (= before (length (fumos-test-server-lines server))))
+          (should (eq first-timer
+                      (fumos-connection-game-reload-timer connection)))
+          (should (= generation
+                     (fumos-connection-game-reload-generation connection)))
+          (should (equal "temp"
+                         (fumos-connection-pending-game-reload connection)))))
+      (fumos-repl--cancel-game-reload-timer connection))))
+
+(ert-deftest fumos-game-reload-rejects-pid-reuse ()
+  (let* ((root (make-temp-file "fumos-game-pid-root-" t))
+         (token (make-string 64 ?a))
+         (connection (fumos-test-game-connection root token))
+         (captured-start (current-time))
+         (current-start captured-start)
+         callback connected)
+    (unwind-protect
+        (cl-letf
+            (((symbol-function 'process-attributes)
+              (lambda (_pid)
+                (fumos-test-process-attributes-at current-start)))
+             ((symbol-function 'run-at-time)
+              (lambda (_delay _repeat function &rest _)
+                (setq callback function)
+                'game-timer))
+             ((symbol-function 'timerp)
+              (lambda (value) (eq value 'game-timer)))
+             ((symbol-function 'cancel-timer) #'ignore)
+             ((symbol-function 'fumos-discover-instances)
+              (lambda (_root)
+                (list
+                 (make-fumos-instance
+                  :project-root root :mod-id "demo" :pid 4242
+                  :token (make-string 64 ?b)))))
+             ((symbol-function 'fumos-repl-connect-instance)
+              (lambda (&rest _) (setq connected t))))
+          (let ((operation
+                 (fumos-eval--begin-game-reload connection "temp")))
+            (fumos-eval--await-game-reload connection operation))
+          (setq current-start (time-add captured-start (seconds-to-time 1)))
+          (funcall callback)
+          (funcall callback)
+          (should-not connected)
+          (should (equal "temp"
+                         (fumos-connection-pending-game-reload connection))))
+      (fumos-repl--cancel-game-reload-timer connection)
+      (delete-directory root t))))
+
+(ert-deftest fumos-game-reload-rejects-transport-generation-change ()
+  (let* ((root (make-temp-file "fumos-game-generation-root-" t))
+         (connection
+          (fumos-test-game-connection root (make-string 64 ?a)))
+         (start (current-time)) callback connected)
+    (unwind-protect
+        (cl-letf
+            (((symbol-function 'process-attributes)
+              (lambda (_pid) (fumos-test-process-attributes-at start)))
+             ((symbol-function 'run-at-time)
+              (lambda (_delay _repeat function &rest _)
+                (setq callback function)
+                'generation-timer))
+             ((symbol-function 'timerp)
+              (lambda (value) (eq value 'generation-timer)))
+             ((symbol-function 'cancel-timer) #'ignore)
+             ((symbol-function 'fumos-discover-instances)
+              (lambda (_root)
+                (list
+                 (make-fumos-instance
+                  :project-root root :mod-id "demo" :pid 4242
+                  :token (make-string 64 ?b)))))
+             ((symbol-function 'fumos-repl-connect-instance)
+              (lambda (&rest _) (setq connected t))))
+          (let ((operation
+                 (fumos-eval--begin-game-reload connection "temp")))
+            (fumos-eval--await-game-reload connection operation))
+          (cl-incf (fumos-connection-generation connection))
+          (funcall callback)
+          (should-not connected)
+          (should (equal "temp"
+                         (fumos-connection-pending-game-reload connection))))
+      (fumos-repl--cancel-game-reload-timer connection)
+      (delete-directory root t))))
+
+(ert-deftest fumos-game-reload-timer-and-connection-print-without-token ()
+  (let* ((root (make-temp-file "fumos-game-print-root-" t))
+         (token (make-string 64 ?a))
+         (digest (secure-hash 'sha256 token))
+         (connection (fumos-test-game-connection root token))
+         (start (current-time))
+         (original-run-at-time (symbol-function 'run-at-time))
+         operation timer)
+    (unwind-protect
+        (cl-letf
+            (((symbol-function 'process-attributes)
+              (lambda (_pid) (fumos-test-process-attributes-at start)))
+             ((symbol-function 'run-at-time)
+              (lambda (_delay _repeat callback &rest _)
+                (funcall original-run-at-time 3600 nil callback))))
+          (setq operation
+                (fumos-eval--begin-game-reload connection "temp")
+                timer (fumos-eval--await-game-reload connection operation))
+          (let ((printed (prin1-to-string (list operation timer connection))))
+            (should-not (string-match-p (regexp-quote token) printed))
+            (should (string-match-p (regexp-quote digest) printed))))
+      (fumos-repl--cancel-game-reload-timer connection)
+      (delete-directory root t))))
+
+(ert-deftest fumos-game-reload-descriptor-match-is-identity-bound-and-once ()
+  (let* ((root (make-temp-file "fumos-game-match-root-" t))
+         (other-root (make-temp-file "fumos-game-other-root-" t))
+         (old-token (make-string 64 ?a))
+         (new-token (make-string 64 ?b))
+         (connection (fumos-test-game-connection root old-token))
+         (old (fumos-connection-instance connection))
+         (same-token
+          (make-fumos-instance
+           :project-root root :mod-id "demo" :pid 4242 :token old-token))
+         (wrong-root
+          (make-fumos-instance
+           :project-root other-root :mod-id "demo" :pid 4242 :token new-token))
+         (wrong-pid
+          (make-fumos-instance
+           :project-root root :mod-id "demo" :pid 5252 :token new-token))
+         (match
+          (make-fumos-instance
+           :project-root root :mod-id "demo" :pid 4242 :token new-token))
+         (start (current-time))
+         (race nil) (attribute-read 0)
+         candidates callback connected canceled)
+    (unwind-protect
+        (cl-letf
+            (((symbol-function 'process-attributes)
+              (lambda (_pid)
+                (cl-incf attribute-read)
+                (fumos-test-process-attributes-at
+                 (if (and race (cl-evenp attribute-read))
+                     (time-add start (seconds-to-time 1))
+                   start))))
+             ((symbol-function 'run-at-time)
+              (lambda (_delay _repeat function &rest _)
+                (setq callback function)
+                'match-timer))
+             ((symbol-function 'timerp)
+              (lambda (value) (eq value 'match-timer)))
+             ((symbol-function 'cancel-timer)
+              (lambda (value) (push value canceled)))
+             ((symbol-function 'fumos-discover-instances)
+              (lambda (_root) candidates))
+             ((symbol-function 'fumos-repl-connect-instance)
+              (lambda (instance) (push instance connected) 'replacement)))
+          (let ((operation
+                 (fumos-eval--begin-game-reload connection "temp")))
+            (fumos-eval--await-game-reload connection operation))
+          (dolist (candidate (list old same-token wrong-root wrong-pid))
+            (setq candidates (list candidate))
+            (funcall callback)
+            (should-not connected)
+            (should (fumos-connection-pending-game-reload connection)))
+          (setq candidates (list match) race t attribute-read 1)
+          (funcall callback)
+          (should-not connected)
+          (should (fumos-connection-pending-game-reload connection))
+          (setq race nil attribute-read 0)
+          (funcall callback)
+          (should (equal (list match) connected))
+          (should-not (fumos-connection-pending-game-reload connection))
+          (funcall callback)
+          (should (equal (list match) connected))
+          (should (= 1 (length canceled))))
+      (fumos-repl--cancel-game-reload-timer connection)
+      (delete-directory other-root t)
+      (delete-directory root t))))
+
+(ert-deftest fumos-game-reload-scheduler-exits-clear-operation ()
+  (dolist (kind '(error quit throw non-timer))
+    (let* ((root (make-temp-file "fumos-game-scheduler-root-" t))
+           (connection
+            (fumos-test-game-connection root (make-string 64 ?a)))
+           (start (current-time)) outcome)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'fumos-repl-current-connection)
+                (lambda () connection))
+               ((symbol-function 'process-attributes)
+                (lambda (_pid) (fumos-test-process-attributes-at start)))
+               ((symbol-function 'fumos-repl-send-eval)
+                (lambda (&rest _) 17))
+               ((symbol-function 'run-at-time)
+                (lambda (&rest _)
+                  (pcase kind
+                    ('error (error "scheduler failed"))
+                    ('quit (signal 'quit nil))
+                    ('throw (throw 'fumos-scheduler-exit :thrown))
+                    ('non-timer 'not-a-timer))))
+               ((symbol-function 'timerp)
+                (lambda (value) (and value (not (eq value 'not-a-timer)))))
+               ((symbol-function 'cancel-timer) #'ignore))
+            (setq
+             outcome
+             (pcase kind
+               ('error
+                (condition-case caught
+                    (fumos-eval--reload-game "temp")
+                  (error (car caught))))
+               ('quit
+                (condition-case caught
+                    (fumos-eval--reload-game "temp")
+                  (quit (car caught))))
+               ('throw
+                (catch 'fumos-scheduler-exit
+                  (fumos-eval--reload-game "temp") :not-thrown))
+               ('non-timer
+                (condition-case caught
+                    (fumos-eval--reload-game "temp")
+                  (error (car caught))))))
+            (should (eq (pcase kind
+                          ('error 'error)
+                          ('quit 'quit)
+                          ('throw :thrown)
+                          ('non-timer 'user-error))
+                        outcome))
+            (should-not (fumos-connection-pending-game-reload connection))
+            (should-not (fumos-connection-game-reload-timer connection))
+            (should (> (fumos-connection-game-reload-generation connection)
+                       0)))
+        (fumos-repl--cancel-game-reload-timer connection)
+        (delete-directory root t)))))
+
+(ert-deftest fumos-game-reload-timer-validation-and-cancel-exits-are-field-first ()
+  (let* ((root (make-temp-file "fumos-game-timer-root-" t))
+         (connection
+          (fumos-test-game-connection root (make-string 64 ?a)))
+         (start (current-time)) canceled)
+    (unwind-protect
+        (cl-letf
+            (((symbol-function 'fumos-repl-current-connection)
+              (lambda () connection))
+             ((symbol-function 'process-attributes)
+              (lambda (_pid) (fumos-test-process-attributes-at start)))
+             ((symbol-function 'fumos-repl-send-eval)
+              (lambda (&rest _) 18))
+             ((symbol-function 'run-at-time)
+              (lambda (&rest _) 'validation-timer))
+             ((symbol-function 'timerp)
+              (lambda (&rest _) (error "timerp failed")))
+             ((symbol-function 'cancel-timer)
+              (lambda (timer) (push timer canceled))))
+          (should-error (fumos-eval--reload-game "temp"))
+          (should (equal '(validation-timer) canceled))
+          (should-not (fumos-connection-pending-game-reload connection))
+          (should-not (fumos-connection-game-reload-timer connection)))
+      (delete-directory root t)))
+  (dolist (kind '(error quit))
+    (let ((connection
+           (make-fumos-connection
+            :game-reload-timer 'cancel-timer
+            :pending-game-reload "temp" :game-reload-generation 9))
+          condition)
+      (cl-letf (((symbol-function 'cancel-timer)
+                 (lambda (&rest _) (signal kind nil))))
+        (setq condition
+              (condition-case nil
+                  (progn (fumos-repl--cancel-game-reload-timer connection) nil)
+                ((error quit) t))))
+      (should-not condition)
+      (should-not (fumos-connection-game-reload-timer connection))
+      (should-not (fumos-connection-pending-game-reload connection))
+      (should (> (fumos-connection-game-reload-generation connection) 9)))))
+
+(ert-deftest fumos-game-reload-errors-timeout-and-explicit-teardown-cancel ()
+  ;; Synchronous send exits cannot leave intent behind.
+  (dolist (kind '(error quit))
+    (let* ((root (make-temp-file "fumos-game-send-root-" t))
+           (connection
+            (fumos-test-game-connection root (make-string 64 ?a)))
+           (start (current-time)))
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'fumos-repl-current-connection)
+                (lambda () connection))
+               ((symbol-function 'process-attributes)
+                (lambda (_pid) (fumos-test-process-attributes-at start)))
+               ((symbol-function 'fumos-repl-send-eval)
+                (lambda (&rest _) (signal kind nil))))
+            (condition-case nil
+                (fumos-eval--reload-game "temp")
+              ((error quit) nil))
+            (should-not (fumos-connection-pending-game-reload connection))
+            (should-not (fumos-connection-game-reload-timer connection)))
+        (delete-directory root t))))
+  ;; A non-connection-lost terminal cancels; expected disconnect preserves.
+  (fumos-test-with-ready-connection (connection server)
+    (let ((start (current-time))
+          (original-run-at-time (symbol-function 'run-at-time)))
+      (cl-letf
+          (((symbol-function 'process-attributes)
+            (lambda (_pid) (fumos-test-process-attributes-at start)))
+           ((symbol-function 'run-at-time)
+            (lambda (delay repeat callback &rest arguments)
+              (if (and (equal delay 0.1) (equal repeat 0.1))
+                  (funcall original-run-at-time 3600 nil callback)
+                (apply original-run-at-time
+                       delay repeat callback arguments)))))
+        (setf
+         (fumos-test-server-handler server)
+         (lambda (state client line)
+           (when (fumos-test-eval-request-p line)
+             (fumos-test-send-eval-runtime-error
+              state client line "quick reload rejected"))))
+        (with-current-buffer (fumos-connection-repl-buffer connection)
+          (fumos-reload-game-preserve))
+        (should
+         (fumos-test-wait-until
+          (lambda ()
+            (not (fumos-connection-pending-game-reload connection))))))))
+  (fumos-test-with-ready-connection (connection server)
+    (let ((start (current-time))
+          (original-run-at-time (symbol-function 'run-at-time)))
+      (cl-letf
+          (((symbol-function 'process-attributes)
+            (lambda (_pid) (fumos-test-process-attributes-at start)))
+           ((symbol-function 'run-at-time)
+            (lambda (delay repeat callback &rest arguments)
+              (if (and (equal delay 0.1) (equal repeat 0.1))
+                  (funcall original-run-at-time 3600 nil callback)
+                (apply original-run-at-time
+                       delay repeat callback arguments)))))
+        (setf
+         (fumos-test-server-handler server)
+         (lambda (state _client line)
+           (when (fumos-test-eval-request-p line)
+             (fumos-test-server-drop-client state))))
+        (with-current-buffer (fumos-connection-repl-buffer connection)
+          (fumos-reload-game-preserve))
+        (should
+         (fumos-test-wait-until
+          (lambda () (eq 'disconnected
+                         (fumos-connection-state connection)))))
+        (should (equal "temp"
+                       (fumos-connection-pending-game-reload connection)))
+        (should (fumos-connection-game-reload-timer connection))
+        (fumos-repl--cancel-game-reload-timer connection))))
+  ;; Deadline and explicit operations invalidate field-first.
+  (let* ((root (make-temp-file "fumos-game-timeout-root-" t))
+         (connection
+          (fumos-test-game-connection root (make-string 64 ?a)))
+         (start (current-time)) (now 0.0) callback messages)
+    (unwind-protect
+        (cl-letf
+            (((symbol-function 'process-attributes)
+              (lambda (_pid) (fumos-test-process-attributes-at start)))
+             ((symbol-function 'float-time) (lambda (&rest _) now))
+             ((symbol-function 'run-at-time)
+              (lambda (_delay _repeat function &rest _)
+                (setq callback function) 'timeout-timer))
+             ((symbol-function 'timerp)
+              (lambda (value) (eq value 'timeout-timer)))
+             ((symbol-function 'cancel-timer) #'ignore)
+             ((symbol-function 'fumos-discover-instances) (lambda (_) nil))
+             ((symbol-function 'message)
+              (lambda (format-string &rest args)
+                (push (apply #'format format-string args) messages))))
+          (let ((operation
+                 (fumos-eval--begin-game-reload connection "temp")))
+            (fumos-eval--await-game-reload connection operation))
+          (setq now 11.0)
+          (funcall callback)
+          (should-not (fumos-connection-pending-game-reload connection))
+          (should (seq-some
+                   (lambda (value) (string-match-p "timed out" value))
+                   messages)))
+      (delete-directory root t)))
+  (dolist (operation '(close disconnect))
+    (let ((connection
+           (make-fumos-connection
+            :game-reload-timer 'explicit-timer
+            :pending-game-reload "temp" :game-reload-generation 3
+            :state 'ready)))
+      (cl-letf (((symbol-function 'cancel-timer) #'ignore)
+                ((symbol-function 'fumos-repl--teardown-transport) #'ignore)
+                ((symbol-function 'fumos-repl--unregister-if-current) #'ignore)
+                ((symbol-function 'fumos-repl-current-connection)
+                 (lambda () connection))
+                ((symbol-function 'fumos-repl--mark-disconnected) #'ignore))
+        (if (eq operation 'close)
+            (fumos-repl-close connection)
+          (fumos-disconnect)))
+      (should-not (fumos-connection-pending-game-reload connection))
+      (should-not (fumos-connection-game-reload-timer connection)))))
+
+(ert-deftest fumos-game-reload-connect-exits-are-contained-and-once ()
+  (dolist (kind '(error quit))
+    (let* ((root (make-temp-file "fumos-game-connect-root-" t))
+           (token (make-string 64 ?a))
+           (connection (fumos-test-game-connection root token))
+           (start (current-time)) callback (calls 0) messages)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'process-attributes)
+                (lambda (_pid) (fumos-test-process-attributes-at start)))
+               ((symbol-function 'run-at-time)
+                (lambda (_delay _repeat function &rest _)
+                  (setq callback function) 'connect-timer))
+               ((symbol-function 'timerp)
+                (lambda (value) (eq value 'connect-timer)))
+               ((symbol-function 'cancel-timer) #'ignore)
+               ((symbol-function 'fumos-discover-instances)
+                (lambda (_root)
+                  (list
+                   (make-fumos-instance
+                    :project-root root :mod-id "demo" :pid 4242
+                    :token (make-string 64 ?b)))))
+               ((symbol-function 'fumos-repl-connect-instance)
+                (lambda (&rest _)
+                  (cl-incf calls)
+                  (signal kind nil)))
+               ((symbol-function 'message)
+                (lambda (format-string &rest args)
+                  (push (apply #'format format-string args) messages))))
+            (let ((operation
+                   (fumos-eval--begin-game-reload connection "temp")))
+              (fumos-eval--await-game-reload connection operation))
+            (should-not (condition-case nil (progn (funcall callback) nil)
+                          ((error quit) t)))
+            (funcall callback)
+            (should (= 1 calls))
+            (should-not (fumos-connection-pending-game-reload connection))
+            (should
+             (seq-some
+              (lambda (value)
+                (string-match-p "FUMOS game reload reconnect failed" value))
+              messages))
+            (dolist (value messages)
+              (should-not (string-match-p (regexp-quote token) value))))
+        (delete-directory root t)))))
+
 (provide 'fumos-eval-test)
 ;;; fumos-eval-test.el ends here

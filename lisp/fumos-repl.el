@@ -50,7 +50,7 @@
   last-error generation retry-timers callback-timers callback-deliveries closing
   terminal-timers terminal-deliveries game-reload-timer game-reload-generation
   linked-buffers macro-cache macro-cache-valid macro-refresh-pending
-  macro-refresh-id macro-refresh-generation)
+  macro-refresh-id macro-refresh-generation macro-refresh-epoch)
 
 (defvar fumos-repl--connections (make-hash-table :test #'equal))
 (defvar fumos-repl--attach-transitions (make-hash-table :test #'equal)
@@ -95,7 +95,7 @@
 
 (defun fumos-repl--cancel-timer (timer)
   "Cancel TIMER without allowing cleanup errors to escape."
-  (when (timerp timer)
+  (when timer
     (condition-case nil
         (cancel-timer timer)
       (quit nil)
@@ -287,7 +287,7 @@
    :active-request-ids nil :retry-timers nil :callback-timers nil
    :callback-deliveries (make-hash-table :test #'eql)
    :terminal-timers nil :terminal-deliveries nil
-   :game-reload-generation 0))
+   :game-reload-generation 0 :macro-refresh-epoch 0))
 
 (defun fumos-repl--open-instance (connection)
   "Create buffers/socket and send AUTH for CONNECTION as one transaction."
@@ -920,11 +920,12 @@
 (defun fumos-repl--cancel-game-reload-timer (connection)
   "Cancel and invalidate CONNECTION's editor-side game reload wait."
   (let ((timer (fumos-connection-game-reload-timer connection)))
-    (when (timerp timer) (cancel-timer timer)))
-  (setf (fumos-connection-game-reload-timer connection) nil
-        (fumos-connection-game-reload-generation connection)
-        (1+ (or (fumos-connection-game-reload-generation connection) 0))
-        (fumos-connection-pending-game-reload connection) nil))
+    ;; Invalidate ownership before cancellation can reenter or signal.
+    (setf (fumos-connection-game-reload-timer connection) nil
+          (fumos-connection-game-reload-generation connection)
+          (1+ (or (fumos-connection-game-reload-generation connection) 0))
+          (fumos-connection-pending-game-reload connection) nil)
+    (fumos-repl--cancel-timer timer)))
 
 (defun fumos-repl--unregister-if-current (connection)
   "Remove CONNECTION only when it is still the registered object."
@@ -1094,7 +1095,9 @@
           (fumos-connection-macro-cache-valid connection) nil
           (fumos-connection-macro-refresh-pending connection) nil
           (fumos-connection-macro-refresh-id connection) nil
-          (fumos-connection-macro-refresh-generation connection) nil)
+          (fumos-connection-macro-refresh-generation connection) nil
+          (fumos-connection-macro-refresh-epoch connection)
+          (1+ (or (fumos-connection-macro-refresh-epoch connection) 0)))
     (fumos-repl--cancel-callback-deliveries connection)
     (fumos-repl--cancel-timer
      (fumos-connection-handshake-timer connection))
@@ -1324,21 +1327,35 @@
             (error nil)))))))
 
 (defun fumos-repl--macro-refresh-current-p
-    (connection process generation repl-buffer request-id)
+    (connection process generation repl-buffer epoch request-id
+                callback-identity)
   "Return non-nil while one macro refresh still owns its transport."
-  (and (fumos-connection-macro-refresh-pending connection)
-       (eql request-id (fumos-connection-macro-refresh-id connection))
-       (eql generation
-            (fumos-connection-macro-refresh-generation connection))
-       (eq repl-buffer (fumos-connection-repl-buffer connection))
-       (fumos-repl--owns-transport-p connection process generation)))
+  (let ((delivery
+         (and (integerp request-id)
+              (gethash request-id
+                       (fumos-repl--callback-delivery-table connection)))))
+    (and (fumos-connection-macro-refresh-pending connection)
+         (eql epoch (fumos-connection-macro-refresh-epoch connection))
+         (eql request-id (fumos-connection-macro-refresh-id connection))
+         (eql generation
+              (fumos-connection-macro-refresh-generation connection))
+         (eq repl-buffer (fumos-connection-repl-buffer connection))
+         (fumos-repl--owns-transport-p connection process generation)
+         (fumos-callback-delivery-p delivery)
+         (eq callback-identity
+             (fumos-callback-delivery-callbacks delivery)))))
 
 (defun fumos-repl--complete-macro-refresh
-    (connection process generation repl-buffer request-id values)
+    (connection process generation repl-buffer epoch request-id
+                callback-identity values)
   "Commit VALUES to CONNECTION's cache when every owner identity matches."
   (when (fumos-repl--macro-refresh-current-p
-         connection process generation repl-buffer request-id)
-    (let ((parsed (fumos-repl--parse-macro-cache (car values))))
+         connection process generation repl-buffer epoch request-id
+         callback-identity)
+    (let ((parsed
+           (and (consp values)
+                (null (cdr values))
+                (fumos-repl--parse-macro-cache (car values)))))
       (setf (fumos-connection-macro-refresh-pending connection) nil
             (fumos-connection-macro-refresh-id connection) nil
             (fumos-connection-macro-refresh-generation connection) nil)
@@ -1349,65 +1366,108 @@
          connection process generation)))))
 
 (defun fumos-repl--fail-macro-refresh
-    (connection process generation repl-buffer request-id &rest _error)
+    (connection process generation repl-buffer epoch request-id
+                callback-identity &rest _error)
   "Release one failed macro refresh without replacing the previous cache."
   (when (fumos-repl--macro-refresh-current-p
-         connection process generation repl-buffer request-id)
+         connection process generation repl-buffer epoch request-id
+         callback-identity)
     (setf (fumos-connection-macro-refresh-pending connection) nil
           (fumos-connection-macro-refresh-id connection) nil
           (fumos-connection-macro-refresh-generation connection) nil)))
 
 (defun fumos-repl--refresh-macro-cache (connection)
-  "Start one nonblocking, generation-owned macro refresh for CONNECTION."
+  "Start one nonblocking, epoch-owned macro refresh for CONNECTION."
   (let* ((process (fumos-connection-process connection))
          (generation (fumos-connection-generation connection))
-         (repl-buffer (fumos-connection-repl-buffer connection)))
+         (repl-buffer (fumos-connection-repl-buffer connection))
+         (state (fumos-connection-state connection)))
     (when (and (not (fumos-connection-macro-refresh-pending connection))
                (buffer-live-p repl-buffer)
                (fumos-repl--owns-transport-p
-                connection process generation))
-      (setf (fumos-connection-macro-refresh-pending connection) t
-            (fumos-connection-macro-refresh-generation connection) generation)
-      (condition-case nil
-          (with-current-buffer repl-buffer
-            (let (request-id)
-              (setq
-               request-id
-               (fennel-proto-repl-send-message
-                :eval (fumos-repl--macro-query-expression)
-                (lambda (values)
-                  (fumos-repl--complete-macro-refresh
-                   connection process generation repl-buffer
-                   request-id values))
-                (lambda (&rest error-data)
-                  (apply #'fumos-repl--fail-macro-refresh
-                         connection process generation repl-buffer
-                         request-id error-data))
-                #'ignore))
-              (unless (integerp request-id)
-                (error "FUMOS macro refresh did not allocate a request"))
-              (setf (fumos-connection-macro-refresh-id connection) request-id)
-              request-id))
-        ((error quit)
-         (setf (fumos-connection-macro-refresh-pending connection) nil
-               (fumos-connection-macro-refresh-id connection) nil
-               (fumos-connection-macro-refresh-generation connection) nil)
-         (fumos-repl--reject connection "Macro refresh setup failed")
-         (error "FUMOS macro refresh setup failed"))))))
+                connection process generation)
+               (memq state '(bootstrapping ready busy)))
+      (let ((epoch
+             (1+ (or (fumos-connection-macro-refresh-epoch connection) 0)))
+            request-id committed)
+        (setf (fumos-connection-macro-refresh-epoch connection) epoch
+              (fumos-connection-macro-refresh-pending connection) t
+              (fumos-connection-macro-refresh-generation connection) generation)
+        (unwind-protect
+            (condition-case nil
+                (with-current-buffer repl-buffer
+                  (let (callback-identity)
+                    (setq
+                     request-id
+                     (fumos-repl--send-framed-request
+                      connection
+                      (lambda (id)
+                        (fumos-repl--format-eval-request
+                         id (fumos-repl--macro-query-expression) nil))
+                      (list
+                       :values
+                       (lambda (values)
+                         (fumos-repl--complete-macro-refresh
+                          connection process generation repl-buffer epoch
+                          request-id callback-identity values))
+                       :error
+                       (lambda (&rest error-data)
+                         (apply #'fumos-repl--fail-macro-refresh
+                                connection process generation repl-buffer epoch
+                                request-id callback-identity error-data))
+                       :print #'ignore)
+                      '(bootstrapping ready busy)))
+                    (setq callback-identity
+                          (gethash request-id
+                                   fennel-proto-repl--message-callbacks))
+                    (unless
+                        (and
+                         callback-identity
+                         (fumos-connection-macro-refresh-pending connection)
+                         (eql epoch
+                              (fumos-connection-macro-refresh-epoch connection))
+                         (eql generation
+                              (fumos-connection-macro-refresh-generation
+                               connection))
+                         (eq repl-buffer
+                             (fumos-connection-repl-buffer connection))
+                         (fumos-repl--owns-transport-p
+                          connection process generation))
+                      (error "FUMOS macro refresh ownership changed"))
+                    (setf (fumos-connection-macro-refresh-id connection)
+                          request-id)
+                    (setq committed t)
+                    request-id))
+              ((error quit) nil))
+          (unless committed
+            (when (integerp request-id)
+              (condition-case nil
+                  (when (buffer-live-p repl-buffer)
+                    (with-current-buffer repl-buffer
+                      (fennel-proto-repl--unassign-callbacks request-id)))
+                ((error quit) nil)))
+            (when (eql epoch
+                       (fumos-connection-macro-refresh-epoch connection))
+              (setf (fumos-connection-macro-refresh-pending connection) nil
+                    (fumos-connection-macro-refresh-id connection) nil
+                    (fumos-connection-macro-refresh-generation connection)
+                    nil))))))))
 
-(defun fumos-repl--invalidate-macro-cache (connection)
-  "Invalidate CONNECTION's macro cache and start a fresh owned query.
-The previous cache remains available as a nonblocking display fallback.  Any
-in-flight refresh identity is retired first, so its deferred callback cannot
-make pre-invalidation values valid again within the same transport generation."
+(defun fumos-repl--invalidate-and-refresh-macro-cache (connection)
+  "Invalidate CONNECTION's cache while retaining its stale fallback."
   (when (fumos-connection-p connection)
-    (setf (fumos-connection-macro-cache-valid connection) nil
+    (setf (fumos-connection-macro-refresh-epoch connection)
+          (1+ (or (fumos-connection-macro-refresh-epoch connection) 0))
+          (fumos-connection-macro-cache-valid connection) nil
           (fumos-connection-macro-refresh-pending connection) nil
           (fumos-connection-macro-refresh-id connection) nil
           (fumos-connection-macro-refresh-generation connection) nil)
     (when (and (not (fumos-connection-closing connection))
                (memq (fumos-connection-state connection) '(ready busy)))
       (fumos-repl--refresh-macro-cache connection))))
+
+(defalias 'fumos-repl--invalidate-macro-cache
+  #'fumos-repl--invalidate-and-refresh-macro-cache)
 
 (defun fumos-repl--obtain-macros (connection)
   "Return CONNECTION's cache immediately, refreshing it when invalid."
@@ -1948,10 +2008,12 @@ error or quit to `fumos-repl-connection-error' after complete cleanup."
       (fumos-error-handler type message traceback)
     (fennel-proto-repl--error-handler type message traceback)))
 
-(defun fumos-repl-send-eval (code source callbacks)
-  "Asynchronously send CODE with SOURCE and CALLBACKS over FUMOS."
-  (let* ((connection (or (fumos-repl-current-connection)
-                         (user-error "No FUMOS connection")))
+(defun fumos-repl--send-framed-request
+    (connection formatter callbacks allowed-states)
+  "Transactionally send a request produced by FORMATTER for CONNECTION."
+  (let* ((process (fumos-connection-process connection))
+         (generation (fumos-connection-generation connection))
+         (repl-buffer (fumos-connection-repl-buffer connection))
          (values-callback (or (plist-get callbacks :values) #'ignore))
          (error-callback
           (or (plist-get callbacks :error)
@@ -1959,34 +2021,69 @@ error or quit to `fumos-repl-connection-error' after complete cleanup."
          (print-callback
           (or (plist-get callbacks :print)
               #'fennel-proto-repl--print)))
-    (unless (memq (fumos-connection-state connection) '(ready busy))
+    (unless (memq (fumos-connection-state connection) allowed-states)
       (user-error "FUMOS connection is not ready"))
-    (unless (and (process-live-p (fumos-connection-process connection))
-                 (buffer-live-p (fumos-connection-repl-buffer connection)))
+    (unless (and (process-live-p process)
+                 (buffer-live-p repl-buffer)
+                 (fumos-repl--owns-transport-p
+                  connection process generation))
       (user-error "FUMOS connection is not live"))
-    (with-current-buffer (fumos-connection-repl-buffer connection)
+    (with-current-buffer repl-buffer
       (let (id sent)
         (unwind-protect
             (progn
               (setq id
                     (fennel-proto-repl--assign-callback
                      values-callback error-callback print-callback))
-              (unless (integerp id)
+              (unless (and (integerp id) (> id 0))
                 (user-error "FUMOS could not allocate a request callback"))
-              (let ((request
-                     (fumos-repl--format-eval-request id code source)))
+              (let ((request (funcall formatter id)))
+                (unless (stringp request)
+                  (user-error "FUMOS formatter returned no request"))
                 (when (string-match-p "[\r\n]" request)
-                  (user-error "FUMOS eval request is not one line"))
+                  (user-error "FUMOS request is not one line"))
                 (when (> (fumos-repl--utf8-bytes request)
                          fumos-repl--max-message-bytes)
                   (user-error
-                   "FUMOS eval request exceeds 8388608 bytes"))
-                (fennel-proto-repl--send-string
-                 (fumos-connection-process connection) request))
+                   "FUMOS request exceeds 8388608 bytes"))
+                (unless (fumos-repl--owns-transport-p
+                         connection process generation)
+                  (user-error "FUMOS connection changed during request"))
+                (fennel-proto-repl--send-string process request))
               (setq sent t)
               id)
           (when (and (integerp id) (not sent))
             (fennel-proto-repl--unassign-callbacks id)))))))
+
+(defun fumos-repl-send-eval (code source callbacks)
+  "Asynchronously send CODE with SOURCE and CALLBACKS over FUMOS."
+  (let ((connection (or (fumos-repl-current-connection)
+                        (user-error "No FUMOS connection"))))
+    (fumos-repl--send-framed-request
+     connection
+     (lambda (id) (fumos-repl--format-eval-request id code source))
+     callbacks '(ready busy))))
+
+(defconst fumos-repl--command-ops '(:reload :compile)
+  "Protocol operations accepted by `fumos-repl-send-command'.")
+
+(defun fumos-repl-send-command (op data callbacks)
+  "Asynchronously send whitelisted OP with DATA and CALLBACKS over FUMOS."
+  (unless (memq op fumos-repl--command-ops)
+    (user-error "Unsupported FUMOS protocol command"))
+  (unless (stringp data)
+    (signal 'wrong-type-argument (list 'stringp data)))
+  (let ((connection (or (fumos-repl-current-connection)
+                        (user-error "No FUMOS connection"))))
+    (fumos-repl--send-framed-request
+     connection
+     (lambda (id)
+       ;; Pinned formatting escapes LF but leaves CR literal.  Escape CR in the
+       ;; completed map so DATA round-trips while the wire remains one line.
+       (string-replace
+        "\r" "\\r"
+        (fennel-proto-repl--format-message id op data t)))
+     callbacks '(ready busy))))
 
 (provide 'fumos-repl)
 ;;; fumos-repl.el ends here
