@@ -554,6 +554,68 @@
          (fumos-repl--reject connection "Callback scheduling failed")
          nil)))))
 
+(defun fumos-repl--deliver-read
+    (delivery message prior-timers timer)
+  "Deliver deferred read MESSAGE after DELIVERY's PRIOR-TIMERS settle."
+  (let* ((connection (fumos-callback-delivery-connection delivery))
+         (request-id (fumos-callback-delivery-request-id delivery))
+         (callback-identity (fumos-callback-delivery-callbacks delivery))
+         (repl-buffer (fumos-callback-delivery-repl-buffer delivery)))
+    (setf (fumos-callback-delivery-timers delivery)
+          (delq timer (fumos-callback-delivery-timers delivery))
+          (fumos-connection-callback-timers connection)
+          (delq timer (fumos-connection-callback-timers connection)))
+    (when (fumos-repl--callback-delivery-current-p
+           delivery request-id callback-identity t)
+      (let ((waiting
+             (seq-filter
+              (lambda (prior)
+                (memq prior (fumos-callback-delivery-timers delivery)))
+              prior-timers)))
+        (if waiting
+            (fumos-repl--defer-read delivery message waiting)
+          (condition-case nil
+              (with-current-buffer repl-buffer
+                (fennel-proto-repl--read-handler message))
+            ((error quit)
+             ;; The game is waiting for an input response.  A failed prompt
+             ;; cannot be recovered without terminating this transport.
+             (fumos-repl--reject connection "Read handler failed"))))))
+    (fumos-repl--maybe-forget-callback-delivery delivery)))
+
+(defun fumos-repl--defer-read (delivery message &optional prior-timers)
+  "Schedule request-owned read MESSAGE after any PRIOR-TIMERS."
+  (let* ((connection (fumos-callback-delivery-connection delivery))
+         (request-id (fumos-callback-delivery-request-id delivery))
+         (callback-identity (fumos-callback-delivery-callbacks delivery))
+         (waiting
+          (or prior-timers
+              (copy-sequence (fumos-callback-delivery-timers delivery))))
+         timer)
+    (when (fumos-repl--callback-delivery-current-p
+           delivery request-id callback-identity t)
+      (condition-case nil
+          (progn
+            (setq timer
+                  (run-at-time
+                   0 nil
+                   (lambda ()
+                     (fumos-repl--deliver-read
+                      delivery (copy-tree message) waiting timer))))
+            (unless (timerp timer)
+              (error "FUMOS read scheduler returned no timer"))
+            (push timer (fumos-callback-delivery-timers delivery))
+            (push timer (fumos-connection-callback-timers connection))
+            timer)
+        ((error quit)
+         (fumos-repl--cancel-timer timer)
+         (setf (fumos-callback-delivery-timers delivery)
+               (delq timer (fumos-callback-delivery-timers delivery))
+               (fumos-connection-callback-timers connection)
+               (delq timer (fumos-connection-callback-timers connection)))
+         (fumos-repl--reject connection "Read scheduling failed")
+         nil)))))
+
 (defun fumos-repl--safe-callback (delivery callback kind)
   "Return a protocol-safe wrapper for DELIVERY's CALLBACK of KIND."
   (lambda (&rest arguments)
@@ -1163,7 +1225,7 @@
        nil))))
 
 (defun fumos-repl--handle-protocol-op-advice (original message)
-  "Bind upstream retry scheduling to the FUMOS transport that received it."
+  "Own FUMOS retry and read scheduling on the receiving transport."
   (let* ((repl-buffer
           (and fennel-proto-repl--buffer
                (get-buffer fennel-proto-repl--buffer)))
@@ -1177,19 +1239,31 @@
                  (and (hash-table-p fennel-proto-repl--message-callbacks)
                       (gethash outer-id
                                fennel-proto-repl--message-callbacks))))))
-    (if (and connection (equal "retry" (plist-get message :op)))
-        (when outer-callbacks
-          (let* ((wire-message (plist-get message :message))
-                 (message-id (fumos-repl--retry-message-id wire-message))
-                 (callbacks
-                  (and message-id
-                       (with-current-buffer repl-buffer
-                         (gethash message-id
-                                  fennel-proto-repl--message-callbacks)))))
-            (when callbacks
-              (fumos-repl--schedule-retry
-               connection message-id wire-message callbacks))))
-      (funcall original message))))
+    (cond
+     ((and connection (equal "retry" (plist-get message :op)))
+      (when outer-callbacks
+        (let* ((wire-message (plist-get message :message))
+               (message-id (fumos-repl--retry-message-id wire-message))
+               (callbacks
+                (and message-id
+                     (with-current-buffer repl-buffer
+                       (gethash message-id
+                                fennel-proto-repl--message-callbacks)))))
+          (when callbacks
+            (fumos-repl--schedule-retry
+             connection message-id wire-message callbacks)))))
+     ((and connection (equal "read" (plist-get message :op)))
+      (let ((delivery
+             (and outer-callbacks
+                  (gethash outer-id
+                           (fumos-repl--callback-delivery-table connection)))))
+        (if (and delivery
+                 (eq outer-callbacks
+                     (fumos-callback-delivery-callbacks delivery)))
+            (fumos-repl--defer-read delivery (copy-tree message))
+          (fumos-repl--reject connection "Unowned read request"))))
+     (t
+      (funcall original message)))))
 
 (unless (advice-member-p #'fumos-repl--handle-protocol-op-advice
                          'fennel-proto-repl--handle-protocol-op)

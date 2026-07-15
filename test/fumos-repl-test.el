@@ -1766,6 +1766,146 @@
       (delete-directory second-root t)
       (delete-directory first-root t))))
 
+(defun fumos-test-run-captured-timer (entry)
+  "Run one dormant timer ENTRY captured as (TIMER FUNCTION ARGS)."
+  (apply (nth 1 entry) (nth 2 entry)))
+
+(ert-deftest fumos-print-precedes-read-outside-the-protocol-filter ()
+  (fumos-test-with-ready-connection (connection server)
+    (let ((process (fumos-connection-process connection))
+          (repl (fumos-connection-repl-buffer connection))
+          scheduled events request-id)
+      (with-current-buffer repl
+        (setq request-id
+              (fennel-proto-repl-send-message
+               :eval "(do (io.write \"name? \" ) (io.read))"
+               #'ignore #'ignore
+               (lambda (&rest _)
+                 (setq events (append events '(print)))))))
+      (let ((fennel-proto-repl-read-handler
+             (lambda (_message)
+               (setq events (append events '(read))))))
+        (cl-letf (((symbol-function 'run-at-time)
+                   (lambda (_delay _repeat callback &rest arguments)
+                     (let ((timer (timer-create)))
+                       (push (list timer callback arguments) scheduled)
+                       timer))))
+          (funcall
+           (process-filter process) process
+           (format
+            (concat "(:id %d :op \"print\" :data \"name? \")\n"
+                    "(:id %d :op \"read\" :formats (\"l\"))\n")
+            request-id request-id))
+          ;; Neither UI action may run in the network filter stack.
+          (should-not events)
+          (should (= 2 (length scheduled)))
+          (let ((read-entry (car scheduled))
+                (print-entry (cadr scheduled)))
+            ;; Even if Emacs selects the read timer first, it must wait for
+            ;; every earlier request-owned print delivery.
+            (fumos-test-run-captured-timer read-entry)
+            (should-not events)
+            (let ((rescheduled-read (car scheduled)))
+              (fumos-test-run-captured-timer print-entry)
+              (should (equal '(print) events))
+              (fumos-test-run-captured-timer rescheduled-read)
+              (should (equal '(print read) events)))))
+        (should-not (fumos-connection-callback-timers connection))))))
+
+(ert-deftest fumos-disconnect-cancels-deferred-read-and-prior-print ()
+  (fumos-test-with-ready-connection (connection server)
+    (let ((process (fumos-connection-process connection))
+          (repl (fumos-connection-repl-buffer connection))
+          scheduled events request-id)
+      (with-current-buffer repl
+        (setq request-id
+              (fennel-proto-repl-send-message
+               :eval "(do (io.write \"name? \" ) (io.read))"
+               #'ignore #'ignore
+               (lambda (&rest _)
+                 (setq events (append events '(print)))))))
+      (let ((fennel-proto-repl-read-handler
+             (lambda (_message)
+               (setq events (append events '(read))))))
+        (cl-letf (((symbol-function 'run-at-time)
+                   (lambda (_delay _repeat callback &rest arguments)
+                     (let ((timer (timer-create)))
+                       (push (list timer callback arguments) scheduled)
+                       timer))))
+          (funcall
+           (process-filter process) process
+           (format
+            (concat "(:id %d :op \"print\" :data \"name? \")\n"
+                    "(:id %d :op \"read\" :formats (\"l\"))\n")
+            request-id request-id)))
+        (should (= 2 (length scheduled)))
+        (fumos-repl--mark-disconnected connection "test disconnect")
+        (dolist (entry scheduled)
+          ;; Simulate canceled timer closures that were already dequeued.
+          (fumos-test-run-captured-timer entry))
+        (should-not events)
+        (should-not (fumos-connection-callback-timers connection))))))
+
+(ert-deftest fumos-read-scheduler-failures-close-without-escaping ()
+  (dolist (kind '(error quit non-timer))
+    (fumos-test-with-ready-connection (connection server)
+      (let* ((process (fumos-connection-process connection))
+             (repl (fumos-connection-repl-buffer connection))
+             (request-id
+              (with-current-buffer repl
+                (fennel-proto-repl-send-message
+                 :eval "(io.read)" #'ignore #'ignore #'ignore)))
+             escaped)
+        (cl-letf (((symbol-function 'run-at-time)
+                   (lambda (&rest _)
+                     (pcase kind
+                       ('error (error "injected read scheduler error"))
+                       ('quit (signal 'quit nil))
+                       (_ 'not-a-timer)))))
+          (condition-case condition
+              (funcall
+               (process-filter process) process
+               (format "(:id %d :op \"read\" :formats (\"l\"))\n"
+                       request-id))
+            ((error quit) (setq escaped condition))))
+        (should-not escaped)
+        (should (eq 'disconnected
+                    (fumos-connection-state connection)))
+        (should-not (fumos-connection-callback-timers connection))))))
+
+(ert-deftest fumos-read-handler-exits-are-contained-and-close-transport ()
+  (dolist (kind '(error quit throw))
+    (fumos-test-with-ready-connection (connection server)
+      (let* ((process (fumos-connection-process connection))
+             (repl (fumos-connection-repl-buffer connection))
+             (request-id
+              (with-current-buffer repl
+                (fennel-proto-repl-send-message
+                 :eval "(io.read)" #'ignore #'ignore #'ignore)))
+             captured invoked)
+        (cl-letf (((symbol-function 'run-at-time)
+                   (lambda (_delay _repeat callback &rest arguments)
+                     (let ((timer (timer-create)))
+                       (setq captured (list timer callback arguments))
+                       timer))))
+          (funcall
+           (process-filter process) process
+           (format "(:id %d :op \"read\" :formats (\"l\"))\n"
+                   request-id)))
+        (should captured)
+        (let ((fennel-proto-repl-read-handler
+               (lambda (_message)
+                 (setq invoked t)
+                 (pcase kind
+                   ('error (error "injected read handler error"))
+                   ('quit (signal 'quit nil))
+                   (_ (throw 'fumos-missing-read-catch :escaped))))))
+          (fumos-test-run-captured-timer captured))
+        (should invoked)
+        (should (eq 'disconnected
+                    (fumos-connection-state connection)))
+        (should-not (fumos-connection-callback-timers connection))))))
+
 (ert-deftest fumos-callback-nonlocal-exits-cannot-block-same-chunk-done ()
   (fumos-test-with-ready-connection (connection server)
     (dolist (kind '(error quit throw))
