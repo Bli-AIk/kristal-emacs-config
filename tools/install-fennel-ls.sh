@@ -24,10 +24,15 @@ install_root="$data_home/kristal-emacs-config/fennel-ls"
 prefix="$install_root/$short_commit"
 docset_dir="$data_home/fennel-ls/docsets"
 script_dir=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
-lock="$install_root/.install-$short_commit.lock"
+command -v flock >/dev/null 2>&1 || {
+    printf '%s\n' 'flock is required on Linux' >&2
+    exit 1
+}
+lock_file="$install_root/.install-$short_commit.lock"
 mkdir -p "$install_root"
-if ! mkdir "$lock" 2>/dev/null; then
-    printf 'another fennel-ls install holds %s\n' "$lock" >&2
+exec 9>"$lock_file"
+if ! flock -n 9; then
+    printf 'another fennel-ls install holds %s\n' "$lock_file" >&2
     exit 1
 fi
 tmp=
@@ -37,7 +42,6 @@ cleanup() {
     [ -z "$doc_tmp" ] || rm -f "$doc_tmp"
     [ -z "$stage" ] || rm -rf "$stage"
     [ -z "$tmp" ] || rm -rf "$tmp"
-    rmdir "$lock" 2>/dev/null || true
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
@@ -51,7 +55,8 @@ publish_docset() {
 }
 
 if [ -e "$prefix" ]; then
-    if [ -d "$prefix" ] && [ -x "$prefix/bin/fennel-ls" ] &&
+    if [ -d "$prefix" ] && [ -f "$prefix/bin/fennel-ls" ] &&
+       [ -x "$prefix/bin/fennel-ls" ] &&
        [ -f "$prefix/SOURCE_COMMIT" ] &&
        [ "$(cat "$prefix/SOURCE_COMMIT")" = "$commit" ]; then
         publish_docset

@@ -56,13 +56,15 @@ run_install "$data" | rg -q '^reused fennel-ls '
 test "$(stat -c %i "$prefix")" = "$inode"
 
 lock="$data/kristal-emacs-config/fennel-ls/.install-0c21b003.lock"
-mkdir "$lock"
+exec 8>"$lock"
+flock -n 8
 if run_install "$data" >/dev/null 2>&1; then
     printf '%s\n' 'installer ignored an active lock' >&2
     exit 1
 fi
 test "$(stat -c %i "$prefix")" = "$inode"
-rmdir "$lock"
+flock -u 8
+exec 8>&-
 
 incomplete="$tmp/incomplete"
 bad_prefix="$incomplete/kristal-emacs-config/fennel-ls/0c21b003"
@@ -74,6 +76,17 @@ if run_install "$incomplete" >/dev/null 2>&1; then
 fi
 test -f "$bad_prefix/keep"
 
+directory_binary="$tmp/directory-binary"
+directory_prefix="$directory_binary/kristal-emacs-config/fennel-ls/0c21b003"
+mkdir -p "$directory_prefix/bin/fennel-ls"
+printf '%s\n' 0c21b0035888de99dfbcf4ca8304f566d906d794 > \
+    "$directory_prefix/SOURCE_COMMIT"
+if run_install "$directory_binary" >/dev/null 2>&1; then
+    printf '%s\n' 'installer accepted a directory as the executable' >&2
+    exit 1
+fi
+test -d "$directory_prefix/bin/fennel-ls"
+
 failed="$tmp/failed"
 if env FUMOS_FAKE_INSTALL_FAIL=1 PATH="$fake_bin:$PATH" \
     XDG_DATA_HOME="$failed" HOME=/nonexistent \
@@ -83,6 +96,6 @@ if env FUMOS_FAKE_INSTALL_FAIL=1 PATH="$fake_bin:$PATH" \
 fi
 test ! -e "$failed/kristal-emacs-config/fennel-ls/0c21b003"
 test -z "$(find "$failed" -name '.0c21b003.new.*' -print -quit)"
-test ! -e "$failed/kristal-emacs-config/fennel-ls/.install-0c21b003.lock"
+test -f "$failed/kristal-emacs-config/fennel-ls/.install-0c21b003.lock"
 
 printf '%s\n' 'FUMOS fennel-ls installer tests passed'
