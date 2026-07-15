@@ -10,23 +10,70 @@ if [ -z "$data_home" ]; then
         printf '%s\n' 'HOME and XDG_DATA_HOME are both empty' >&2
         exit 1
     fi
+    case $home in
+        /*) ;;
+        *) printf '%s\n' 'HOME must be an absolute path' >&2; exit 1 ;;
+    esac
     data_home=$home/.local/share
 fi
-prefix="$data_home/kristal-emacs-config/fennel-ls/$short_commit"
+case $data_home in
+    /*) ;;
+    *) printf '%s\n' 'XDG_DATA_HOME must be an absolute path' >&2; exit 1 ;;
+esac
+install_root="$data_home/kristal-emacs-config/fennel-ls"
+prefix="$install_root/$short_commit"
 docset_dir="$data_home/fennel-ls/docsets"
 script_dir=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+lock="$install_root/.install-$short_commit.lock"
+mkdir -p "$install_root"
+if ! mkdir "$lock" 2>/dev/null; then
+    printf 'another fennel-ls install holds %s\n' "$lock" >&2
+    exit 1
+fi
+tmp=
+stage=
+doc_tmp=
+cleanup() {
+    [ -z "$doc_tmp" ] || rm -f "$doc_tmp"
+    [ -z "$stage" ] || rm -rf "$stage"
+    [ -z "$tmp" ] || rm -rf "$tmp"
+    rmdir "$lock" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 
+publish_docset() {
+    mkdir -p "$docset_dir"
+    doc_tmp=$(mktemp "$docset_dir/.kristal.lua.XXXXXX")
+    install -m 0644 "$script_dir/docsets/kristal.lua" "$doc_tmp"
+    mv -f -T "$doc_tmp" "$docset_dir/kristal.lua"
+    doc_tmp=
+}
+
+if [ -e "$prefix" ]; then
+    if [ -d "$prefix" ] && [ -x "$prefix/bin/fennel-ls" ] &&
+       [ -f "$prefix/SOURCE_COMMIT" ] &&
+       [ "$(cat "$prefix/SOURCE_COMMIT")" = "$commit" ]; then
+        publish_docset
+        printf 'reused fennel-ls %s at %s/bin/fennel-ls\n' "$commit" "$prefix"
+        exit 0
+    fi
+    printf 'existing fennel-ls prefix is incomplete or untrusted: %s\n' \
+        "$prefix" >&2
+    exit 1
+fi
+
+tmp=$(mktemp -d)
 git clone https://git.sr.ht/~xerool/fennel-ls "$tmp/fennel-ls"
 git -C "$tmp/fennel-ls" checkout "$commit"
 test "$(git -C "$tmp/fennel-ls" rev-parse HEAD)" = "$commit"
 make -C "$tmp/fennel-ls" LUA=luajit
-rm -rf "$prefix.new"
-mkdir -p "$prefix.new"
-make -C "$tmp/fennel-ls" install PREFIX="$prefix.new"
-rm -rf "$prefix"
-mv "$prefix.new" "$prefix"
-mkdir -p "$docset_dir"
-install -m 0644 "$script_dir/docsets/kristal.lua" "$docset_dir/kristal.lua"
+stage=$(mktemp -d "$install_root/.${short_commit}.new.XXXXXX")
+make -C "$tmp/fennel-ls" install PREFIX="$stage"
+test -x "$stage/bin/fennel-ls"
+printf '%s\n' "$commit" > "$stage/SOURCE_COMMIT"
+test ! -e "$prefix"
+mv -T "$stage" "$prefix"
+stage=
+publish_docset
 printf 'installed fennel-ls %s at %s/bin/fennel-ls\n' "$commit" "$prefix"

@@ -50,6 +50,14 @@
       (setenv "XDG_DATA_HOME" "")
       (should-error (fumos--xdg-data-home) :type 'user-error))))
 
+(ert-deftest fumos-fennel-ls-rejects-relative-xdg-paths ()
+  (dolist (environment '(("relative-data" "/home/demo")
+                          ("" "relative-home")))
+    (let ((process-environment (copy-sequence process-environment)))
+      (setenv "XDG_DATA_HOME" (car environment))
+      (setenv "HOME" (cadr environment))
+      (should-error (fumos--xdg-data-home) :type 'user-error))))
+
 (ert-deftest fumos-install-project-config-refuses-overwrite ()
   (fumos-eglot-test-with-project root
     (let ((default-directory root))
@@ -62,13 +70,37 @@
                 (insert-file-contents (expand-file-name "flsproject.fnl" root))
                 (buffer-string)))))))
 
+(ert-deftest fumos-install-project-config-copies-pinned-template ()
+  (fumos-eglot-test-with-project root
+    (let ((default-directory root)
+          visited)
+      (cl-letf (((symbol-function 'find-file)
+                 (lambda (file) (setq visited file))))
+        (fumos-install-project-config))
+      (let* ((target (expand-file-name "flsproject.fnl" root))
+             (template (expand-file-name "templates/flsproject.fnl"
+                                         fumos-test-root)))
+        (should (equal target visited))
+        (should
+         (equal
+          (with-temp-buffer
+            (insert-file-contents template)
+            (buffer-string))
+          (with-temp-buffer
+            (insert-file-contents target)
+            (buffer-string))))))))
+
 (ert-deftest fumos-registers-only-fennel-eglot-entry ()
   (let ((eglot-server-programs
          '((lua-mode . ("lua-language-server"))
-           (fennel-mode . ("old-fennel-ls")))))
+           (fennel-mode . ("old-fennel-ls"))
+           (fennel-mode . ("duplicate-fennel-ls")))))
     (fumos-register-fennel-eglot)
     (should (equal '("lua-language-server")
                    (cdr (assq 'lua-mode eglot-server-programs))))
+    (should (= 1 (length (seq-filter
+                           (lambda (entry) (eq (car entry) 'fennel-mode))
+                           eglot-server-programs))))
     (should (eq #'fumos-fennel-ls-command
                 (cdr (assq 'fennel-mode eglot-server-programs))))))
 

@@ -7,17 +7,26 @@
 
 (defconst fumos-fennel-ls-short-commit "0c21b003")
 
+(defun fumos--absolute-local-directory (path variable)
+  "Return PATH as a directory or reject an unsafe VARIABLE value."
+  (unless (and (file-name-absolute-p path)
+               (not (file-remote-p path)))
+    (user-error "%s must be an absolute local path" variable))
+  (file-name-as-directory (expand-file-name path)))
+
 (defun fumos--xdg-data-home ()
   (let ((data-home (getenv "XDG_DATA_HOME"))
         (home (getenv "HOME")))
-    (file-name-as-directory
-     (cond
-      ((and data-home (not (string-empty-p data-home)))
-       (expand-file-name data-home))
-      ((and home (not (string-empty-p home)))
-       (expand-file-name ".local/share" home))
-      (t
-       (user-error "HOME and XDG_DATA_HOME are both empty"))))))
+    (cond
+     ((and data-home (not (string-empty-p data-home)))
+      (fumos--absolute-local-directory data-home "XDG_DATA_HOME"))
+     ((and home (not (string-empty-p home)))
+      (fumos--absolute-local-directory
+       (expand-file-name ".local/share"
+                         (fumos--absolute-local-directory home "HOME"))
+       "HOME"))
+     (t
+      (user-error "HOME and XDG_DATA_HOME are both empty")))))
 
 (defun fumos-fennel-ls-executable ()
   "Return the executable for the pinned fennel-ls build."
