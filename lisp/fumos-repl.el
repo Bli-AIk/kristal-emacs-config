@@ -1307,21 +1307,27 @@ make pre-invalidation values valid again within the same transport generation."
                          'fennel-proto-repl--obtain-macros)
   (advice-add 'fennel-proto-repl--obtain-macros :around
               #'fumos-repl--obtain-macros-advice))
+
+(defun fumos-repl--drain-connection-lost-terminals (connection)
+  "Synchronously deliver every scheduled disconnect terminal once."
+  (fumos-repl--cancel-timer-list
+   (fumos-connection-terminal-timers connection))
+  (dolist (delivery
+           (copy-sequence
+            (fumos-connection-terminal-deliveries connection)))
+    (when (fumos-callback-delivery-p delivery)
+      (fumos-repl--deliver-connection-lost
+       delivery
+       (fumos-callback-delivery-request-id delivery)
+       (fumos-callback-delivery-callbacks delivery)
+       (fumos-callback-delivery-terminal-timer delivery))))
+  (setf (fumos-connection-terminal-timers connection) nil
+        (fumos-connection-terminal-deliveries connection) nil))
+
 (defun fumos-repl-close (connection &optional message)
   "Fully close CONNECTION, unregister it, and remove both owned buffers."
   (when (fumos-connection-p connection)
     (fumos-repl--cancel-game-reload-timer connection)
-    ;; Cancel disconnect terminals that predate this explicit full close.
-    ;; Pending requests discovered by teardown below receive fresh terminals.
-    (fumos-repl--cancel-timer-list
-     (fumos-connection-terminal-timers connection))
-    (dolist (delivery (fumos-connection-terminal-deliveries connection))
-      (when (fumos-callback-delivery-p delivery)
-        (setf (fumos-callback-delivery-terminal-timer delivery) nil
-              (fumos-callback-delivery-connection-lost-state delivery)
-              'delivered)))
-    (setf (fumos-connection-terminal-timers connection) nil
-          (fumos-connection-terminal-deliveries connection) nil)
     (fumos-repl--teardown-transport connection
                                     (or message "Closed by Emacs"))
     (fumos-repl--unregister-if-current connection)
@@ -1337,7 +1343,13 @@ make pre-invalidation values valid again within the same transport generation."
               (rename-buffer
                (generate-new-buffer-name
                 (format " %s closing" (buffer-name repl-buffer))) t)
-            ((error quit) nil)))
+            ((error quit) nil))))
+      ;; Teardown may have admitted connection-lost, and a prior unexpected
+      ;; disconnect may already have a zero-delay terminal in flight.  Free the
+      ;; deterministic name first so a callback can reenter attach safely, then
+      ;; claim and deliver every such terminal before the old buffer is killed.
+      (fumos-repl--drain-connection-lost-terminals connection)
+      (when (buffer-live-p repl-buffer)
         (condition-case nil
             (with-current-buffer repl-buffer
               ;; User hooks may initiate a newer explicit attach.  The public

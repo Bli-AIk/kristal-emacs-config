@@ -1252,6 +1252,114 @@
       (should (buffer-live-p repl-buffer))
       (should-not (process-live-p ui-process)))))
 
+(ert-deftest fumos-full-close-and-replacement-drain-dormant-disconnect-terminal ()
+  (dolist (action '(close replacement))
+    (let* ((fumos-repl--connections (make-hash-table :test #'equal))
+           (root
+            (file-name-as-directory
+             (file-truename
+              (fumos-test-make-project-root
+               (make-temp-file "fumos-terminal-drain-root-" t)))))
+           (old-server
+            (fumos-test-server-start (fumos-test-make-proto-handler 4242)))
+           (new-server
+            (and (eq action 'replacement)
+                 (fumos-test-server-start
+                  (fumos-test-make-proto-handler 4242))))
+           (old
+            (fumos-repl-connect-instance
+             (fumos-test-instance-for-server old-server 4242 root)))
+           (original-run-at-time (symbol-function 'run-at-time))
+           replacement request-id delivery dormant-timer dormant-call terminals)
+      (unwind-protect
+          (progn
+            (should
+             (fumos-test-wait-until
+              (lambda ()
+                (and (eq 'ready (fumos-connection-state old))
+                     (fumos-connection-macro-cache-valid old)))))
+            (with-current-buffer (fumos-connection-repl-buffer old)
+              (setq request-id
+                    (fennel-proto-repl-send-message
+                     :eval "pending-before-drop" #'ignore
+                     (lambda (type &rest _)
+                       (push type terminals))
+                     #'ignore)))
+            (setq delivery
+                  (gethash request-id
+                           (fumos-repl--callback-delivery-table old)))
+            (should (fumos-callback-delivery-p delivery))
+            ;; Keep the zero-delay connection-lost timer dormant while the
+            ;; first teardown completes, exactly as if it had been dequeued
+            ;; too late for the next full-close transition.
+            (cl-letf
+                (((symbol-function 'run-at-time)
+                  (lambda (delay repeat callback &rest arguments)
+                    (if (and (zerop delay) (not dormant-call))
+                        (progn
+                          (setq dormant-timer
+                                (funcall original-run-at-time
+                                         3600 nil #'ignore)
+                                dormant-call (cons callback arguments))
+                          dormant-timer)
+                      (apply original-run-at-time
+                             delay repeat callback arguments)))))
+              (fumos-test-server-drop-client old-server)
+              (should
+               (fumos-test-wait-until
+                (lambda ()
+                  (and dormant-call
+                       (eq 'disconnected (fumos-connection-state old)))))))
+            (should-not terminals)
+            (should (eq 'scheduled
+                        (fumos-callback-delivery-connection-lost-state
+                         delivery)))
+            (should (memq dormant-timer
+                          (fumos-connection-terminal-timers old)))
+            (should (memq delivery
+                          (fumos-connection-terminal-deliveries old)))
+            (pcase action
+              ('close
+               (fumos-repl-close old "explicit close after drop"))
+              ('replacement
+               (setq replacement
+                     (fumos-repl-connect-instance
+                      (fumos-test-instance-for-server
+                       new-server 4242 root "demo" (make-string 64 ?b))))
+               (should
+                (fumos-test-wait-until
+                 (lambda ()
+                   (and (eq 'ready
+                            (fumos-connection-state replacement))
+                        (fumos-connection-macro-cache-valid replacement)))))))
+            (should (equal '("connection-lost") terminals))
+            (should (eq 'delivered
+                        (fumos-callback-delivery-connection-lost-state
+                         delivery)))
+            (should-not (fumos-test-timer-live-p dormant-timer))
+            (should-not (fumos-connection-terminal-timers old))
+            (should-not (fumos-connection-terminal-deliveries old))
+            (should (hash-table-empty-p
+                     (fumos-repl--callback-delivery-table old)))
+            ;; A timer already dequeued before cancelation observes the same
+            ;; claimed terminal and remains a no-op.
+            (apply (car dormant-call) (cdr dormant-call))
+            (should (equal '("connection-lost") terminals))
+            (should-not (fumos-connection-terminal-timers old))
+            (should-not (fumos-connection-terminal-deliveries old))
+            (when replacement
+              (should (eq replacement (gethash root fumos-repl--connections)))
+              (should (process-live-p
+                       (fumos-connection-process replacement)))
+              (should (memq (fumos-connection-state replacement)
+                            '(ready busy)))))
+        (when replacement (fumos-repl-close replacement))
+        (fumos-repl-close old)
+        (when new-server (fumos-test-server-stop new-server))
+        (fumos-test-server-stop old-server)
+        (when (timerp dormant-timer) (cancel-timer dormant-timer))
+        (delete-directory root t)))))
+
 (ert-deftest fumos-eval-without-done-disconnect-has-one-terminal-outcome ()
   (dolist (frame-kind '(values error))
     (fumos-test-with-ready-connection (connection server)
