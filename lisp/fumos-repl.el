@@ -568,6 +568,42 @@
           (apply callback arguments)
         (fumos-repl--defer-callback delivery callback arguments kind)))))
 
+(defun fumos-repl--rollback-callback-assignment
+    (connection repl-buffer delivery request-id)
+  "Invalidate and forget a partially assigned request callback."
+  (let ((inhibit-quit t)
+        (quit-flag nil)
+        (timers (fumos-callback-delivery-timers delivery))
+        (terminal-timer (fumos-callback-delivery-terminal-timer delivery)))
+    (setf (fumos-callback-delivery-valid delivery) nil
+          (fumos-callback-delivery-timers delivery) nil
+          (fumos-callback-delivery-terminal-timer delivery) nil
+          (fumos-callback-delivery-connection-lost-state delivery) 'delivered
+          (fumos-connection-callback-timers connection)
+          (seq-difference (fumos-connection-callback-timers connection)
+                          timers #'eq)
+          (fumos-connection-terminal-timers connection)
+          (delq terminal-timer
+                (fumos-connection-terminal-timers connection))
+          (fumos-connection-terminal-deliveries connection)
+          (delq delivery
+                (fumos-connection-terminal-deliveries connection)))
+    (fumos-repl--cancel-timer-list timers)
+    (fumos-repl--cancel-timer terminal-timer)
+    (when (integerp request-id)
+      (condition-case nil
+          (when (buffer-live-p repl-buffer)
+            (with-current-buffer repl-buffer
+              (when (hash-table-p fennel-proto-repl--message-callbacks)
+                (remhash request-id fennel-proto-repl--message-callbacks))))
+        ((error quit) nil))
+      (condition-case nil
+          (when (hash-table-p
+                 (fumos-connection-callback-deliveries connection))
+            (remhash request-id
+                     (fumos-connection-callback-deliveries connection)))
+        ((error quit) nil)))))
+
 (defun fumos-repl--assign-callback-advice
     (original values-callback &optional error-callback print-callback)
   "Bind every FUMOS callback to its transport and callback record identity."
@@ -590,22 +626,31 @@
                :error-callback resolved-error
                :print-callback resolved-print
                :valid t))
-             (id
-              (funcall
-               original
-               (fumos-repl--safe-callback delivery values-callback 'values)
-               (fumos-repl--safe-callback delivery resolved-error 'error)
-               (fumos-repl--safe-callback delivery resolved-print 'print))))
-        (when id
-          (with-current-buffer repl-buffer
-            (let ((callback-identity
-                   (gethash id fennel-proto-repl--message-callbacks)))
-              (setf (fumos-callback-delivery-request-id delivery) id
-                    (fumos-callback-delivery-callbacks delivery)
-                    callback-identity)
-              (puthash id delivery
-                       (fumos-repl--callback-delivery-table connection)))))
-        id))))
+             id committed)
+        (unwind-protect
+            (progn
+              (setq
+               id
+               (funcall
+                original
+                (fumos-repl--safe-callback delivery values-callback 'values)
+                (fumos-repl--safe-callback delivery resolved-error 'error)
+                (fumos-repl--safe-callback delivery resolved-print 'print)))
+              (when id
+                (with-current-buffer repl-buffer
+                  (let ((callback-identity
+                         (gethash id fennel-proto-repl--message-callbacks)))
+                    (setf (fumos-callback-delivery-request-id delivery) id
+                          (fumos-callback-delivery-callbacks delivery)
+                          callback-identity)
+                    (puthash
+                     id delivery
+                     (fumos-repl--callback-delivery-table connection)))))
+              (setq committed t)
+              id)
+          (unless committed
+            (fumos-repl--rollback-callback-assignment
+             connection repl-buffer delivery id)))))))
 
 (unless (advice-member-p #'fumos-repl--assign-callback-advice
                          'fennel-proto-repl--assign-callback)

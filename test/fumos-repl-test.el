@@ -2705,6 +2705,62 @@
     (should (string-match-p "<redacted>" printed))
     (should-not (string-match-p (regexp-quote token) printed))))
 
+(ert-deftest fumos-callback-assignment-post-assign-exits-roll-back ()
+  (dolist (point '(delivery-table delivery-puthash))
+    (dolist (kind '(error quit))
+      (fumos-test-with-ready-connection (connection server)
+        (let* ((repl (fumos-connection-repl-buffer connection))
+               (delivery-table
+                (fumos-repl--callback-delivery-table connection))
+               (original-table
+                (symbol-function 'fumos-repl--callback-delivery-table))
+               (original-puthash (symbol-function 'puthash))
+               (original-safe
+                (symbol-function 'fumos-repl--safe-callback))
+               (before (length (fumos-test-server-lines server)))
+               injected delivery condition)
+          (with-current-buffer repl
+            (should (hash-table-empty-p
+                     fennel-proto-repl--message-callbacks))
+            (cl-letf
+                (((symbol-function 'fumos-repl--safe-callback)
+                  (lambda (value callback callback-kind)
+                    (setq delivery value)
+                    (funcall original-safe value callback callback-kind)))
+                 ((symbol-function 'fumos-repl--callback-delivery-table)
+                  (lambda (value)
+                    (if (and (eq point 'delivery-table) (not injected))
+                        (progn
+                          (setq injected t)
+                          (signal kind '("post-assign table failure")))
+                      (funcall original-table value))))
+                 ((symbol-function 'puthash)
+                  (lambda (key value table)
+                    (if (and (eq point 'delivery-puthash)
+                             (eq table delivery-table)
+                             (not injected))
+                        (progn
+                          (setq injected t)
+                          (signal kind '("post-assign puthash failure")))
+                      (funcall original-puthash key value table)))))
+              (setq condition
+                    (condition-case caught
+                        (progn
+                          (fennel-proto-repl--assign-callback #'ignore)
+                          (ert-fail "Injected post-assign exit did not propagate"))
+                      ((error quit) caught))))
+            (should (eq kind (car condition)))
+            (should injected)
+            (should (fumos-callback-delivery-p delivery))
+            (should-not (fumos-callback-delivery-valid delivery))
+            (should (hash-table-empty-p
+                     fennel-proto-repl--message-callbacks)))
+          (should (hash-table-empty-p delivery-table))
+          (should-not (fumos-connection-callback-timers connection))
+          (should-not (fumos-connection-terminal-timers connection))
+          (should-not (fumos-connection-terminal-deliveries connection))
+          (should (= before (length (fumos-test-server-lines server)))))))))
+
 (defun fumos-test-wire-message-id (line)
   "Return LINE's canonical top-level request ID."
   (and (string-match ":id \\([0-9]+\\)" line)
