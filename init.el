@@ -41,6 +41,7 @@
                    "fennel-proto-repl.el"))
   (require 'fennel-mode)
   (require 'fumos-project)
+  (require 'fumos-eglot)
   (fumos-project-install))
 
 (provide 'kristal-emacs-config)
