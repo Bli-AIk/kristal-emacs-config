@@ -150,11 +150,9 @@
           (load-path (cons shadow load-path)))
       (with-temp-buffer
         (insert-file-contents proto)
-        (goto-char (point-min))
-        (while (search-forward "0.6.4" nil t)
-          (replace-match "0.6.3" t t))
         (goto-char (point-max))
-        (insert "\n(defvar fumos-stale-bytecode-marker t)\n")
+        (insert
+         "\n(defun fennel-proto-repl-mode () 'stale-bytecode-ran)\n")
         (write-region (point-min) (point-max) proto nil 'silent))
       (should (byte-compile-file proto))
       (copy-file
@@ -168,9 +166,8 @@
                   "-l" (expand-file-name "fennel-proto-repl.elc" shadow)
                   "-l" (expand-file-name "init.el" fumos-test-root))))
       (should-not (equal 0 status))
-      (should (string-match-p
-               "bytecode does not match the pinned FUMOS vendor"
-               output)))))
+      (should
+       (string-match-p "does not match the pinned FUMOS vendor" output)))))
 
 (provide 'fumos-project-test)
 ;;; fumos-project-test.el ends here

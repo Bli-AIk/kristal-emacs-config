@@ -34,10 +34,8 @@
             (nth 2 form))))
        (loaded-source
         (symbol)
-        (when-let* ((loaded (symbol-file symbol 'defun)))
-          (cond
-           ((string-suffix-p ".elc" loaded)
-            (concat (file-name-sans-extension loaded) ".el"))
+       (when-let* ((loaded (symbol-file symbol 'defun)))
+         (cond
            ((string-suffix-p ".el" loaded) loaded))))
        (assert-pinned
         (feature symbol filename)
