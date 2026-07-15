@@ -81,5 +81,8 @@
   (require 'fumos-eval)
   (fumos-project-install))
 
+(when (fboundp 'map!)
+  (require 'fumos-doom))
+
 (provide 'kristal-emacs-config)
 ;;; init.el ends here
