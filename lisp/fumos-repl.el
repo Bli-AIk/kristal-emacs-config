@@ -1899,5 +1899,94 @@ error or quit to `fumos-repl-connection-error' after complete cleanup."
             (_ (user-error "Multiple descriptors claim FUMOS PID %d" pid)))))
     (fumos-repl-connect-instance instance)))
 
+(defconst fumos-repl--max-message-bytes 8388608
+  "Maximum UTF-8 byte size of one FUMOS proto frame, excluding LF.")
+
+(defun fumos-repl--quote-string (value)
+  "Return VALUE as a single-line Fennel string literal."
+  (unless (stringp value)
+    (signal 'wrong-type-argument (list 'stringp value)))
+  (string-replace
+   "\r" "\\r"
+   (fennel-proto-repl--replace-literal-newlines
+    (format "%S" (substring-no-properties value)))))
+
+(defun fumos-repl--valid-source-p (source)
+  "Return non-nil when SOURCE is a complete positive source plist."
+  (and (listp source)
+       (stringp (plist-get source :file))
+       (let ((line (plist-get source :line))
+             (column (plist-get source :column)))
+         (and (integerp line) (> line 0)
+              (integerp column) (> column 0)))))
+
+(defun fumos-repl--format-eval-request (id code source)
+  "Format ID, CODE, and optional SOURCE as one Fennel map."
+  (unless (and (integerp id) (> id 0))
+    (user-error "FUMOS did not allocate a request ID"))
+  (unless (stringp code)
+    (signal 'wrong-type-argument (list 'stringp code)))
+  (when (and source (not (fumos-repl--valid-source-p source)))
+    (user-error "Invalid FUMOS source context"))
+  (if source
+      (format
+       "{:id %d :eval %s :file %s :line %d :column %d}"
+       id
+       (fumos-repl--quote-string code)
+       (fumos-repl--quote-string (plist-get source :file))
+       (plist-get source :line)
+       (plist-get source :column))
+    (format "{:id %d :eval %s}" id (fumos-repl--quote-string code))))
+
+(defun fumos-repl--utf8-bytes (value)
+  "Return VALUE's exact UTF-8 wire byte count."
+  (string-bytes (encode-coding-string value 'utf-8-unix)))
+
+(defun fumos-repl--default-error-handler (type message traceback)
+  "Route a FUMOS eval error through the installed source-aware handler."
+  (if (fboundp 'fumos-error-handler)
+      (fumos-error-handler type message traceback)
+    (fennel-proto-repl--error-handler type message traceback)))
+
+(defun fumos-repl-send-eval (code source callbacks)
+  "Asynchronously send CODE with SOURCE and CALLBACKS over FUMOS."
+  (let* ((connection (or (fumos-repl-current-connection)
+                         (user-error "No FUMOS connection")))
+         (values-callback (or (plist-get callbacks :values) #'ignore))
+         (error-callback
+          (or (plist-get callbacks :error)
+              #'fumos-repl--default-error-handler))
+         (print-callback
+          (or (plist-get callbacks :print)
+              #'fennel-proto-repl--print)))
+    (unless (memq (fumos-connection-state connection) '(ready busy))
+      (user-error "FUMOS connection is not ready"))
+    (unless (and (process-live-p (fumos-connection-process connection))
+                 (buffer-live-p (fumos-connection-repl-buffer connection)))
+      (user-error "FUMOS connection is not live"))
+    (with-current-buffer (fumos-connection-repl-buffer connection)
+      (let (id sent)
+        (unwind-protect
+            (progn
+              (setq id
+                    (fennel-proto-repl--assign-callback
+                     values-callback error-callback print-callback))
+              (unless (integerp id)
+                (user-error "FUMOS could not allocate a request callback"))
+              (let ((request
+                     (fumos-repl--format-eval-request id code source)))
+                (when (string-match-p "[\r\n]" request)
+                  (user-error "FUMOS eval request is not one line"))
+                (when (> (fumos-repl--utf8-bytes request)
+                         fumos-repl--max-message-bytes)
+                  (user-error
+                   "FUMOS eval request exceeds 8388608 bytes"))
+                (fennel-proto-repl--send-string
+                 (fumos-connection-process connection) request))
+              (setq sent t)
+              id)
+          (when (and (integerp id) (not sent))
+            (fennel-proto-repl--unassign-callbacks id)))))))
+
 (provide 'fumos-repl)
 ;;; fumos-repl.el ends here

@@ -78,6 +78,7 @@
   (require 'fumos-eglot)
   (require 'fumos-instance)
   (require 'fumos-repl)
+  (require 'fumos-eval)
   (fumos-project-install))
 
 (provide 'kristal-emacs-config)
