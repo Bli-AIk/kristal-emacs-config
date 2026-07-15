@@ -11,10 +11,12 @@
 
 (defun fumos-test-wait-until (predicate &optional timeout)
   "Wait until PREDICATE returns non-nil, for at most TIMEOUT seconds."
-  (let ((deadline (+ (float-time) (or timeout 2.0))))
-    (while (and (not (funcall predicate)) (< (float-time) deadline))
+  (let ((deadline (+ (float-time) (or timeout 2.0)))
+        result)
+    (while (and (not (setq result (funcall predicate)))
+                (< (float-time) deadline))
       (accept-process-output nil 0.01))
-    (funcall predicate)))
+    result))
 
 (defmacro fumos-test-with-directory (binding &rest body)
   "Bind BINDING to a temporary directory while evaluating BODY."
