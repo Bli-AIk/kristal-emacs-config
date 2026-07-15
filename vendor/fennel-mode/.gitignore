@@ -1,0 +1,8 @@
+/*.elc
+/scratch.fnl
+/scratch.lua
+/.cask
+/coverage
+/test/*.elc
+/fennel-mode-autoloads.el
+/fennel-mode-pkg.el
