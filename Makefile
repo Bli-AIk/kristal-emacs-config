@@ -1,14 +1,21 @@
 EMACS ?= emacs
-TESTS ?= $(wildcard test/*-test.el)
-TEST_LOADS = $(if $(filter test/fumos-eval-test.el,$(TESTS)),\
-  $(filter-out test/fumos-repl-test.el,$(TESTS)),$(TESTS))
+VANILLA_TESTS = \
+	test/harness-test.el \
+	test/vendor-test.el \
+	test/fake-fumos-server-test.el \
+	test/fumos-instance-test.el \
+	test/fumos-project-test.el \
+	test/fumos-eglot-test.el \
+	test/fumos-repl-test.el \
+	test/fumos-eval-test.el
+TESTS ?= $(VANILLA_TESTS)
 LOAD_PATH = -L vendor/fennel-mode -L lisp -L test
 
 .PHONY: test test-upstream test-doom test-installer testall clean
 
 test:
 	$(EMACS) -Q --batch $(LOAD_PATH) -l test/test-helper.el \
-	  $(foreach test,$(TEST_LOADS),-l $(test)) \
+	  $(foreach test,$(TESTS),-l $(test)) \
 	  -f ert-run-tests-batch-and-exit
 
 test-upstream:
