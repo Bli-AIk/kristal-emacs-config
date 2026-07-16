@@ -1432,6 +1432,24 @@
                          (fumos-connection-pending-game-reload connection)))))
       (fumos-repl--cancel-game-reload-timer connection))))
 
+(ert-deftest fumos-game-reload-rejects-invalid-timeout-before-reserving ()
+  (let* ((root (make-temp-file "fumos-game-timeout-config-root-" t))
+         (connection
+          (fumos-test-game-connection root (make-string 64 ?a)))
+         (start (current-time)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'process-attributes)
+                   (lambda (_pid)
+                     (fumos-test-process-attributes-at start))))
+          (dolist (value '(nil 0 -1 "30"))
+            (let ((fumos-game-reload-timeout value))
+              (should-error
+               (fumos-eval--begin-game-reload connection "temp")
+               :type 'user-error)
+              (should-not
+               (fumos-connection-pending-game-reload connection)))))
+      (delete-directory root t))))
+
 (ert-deftest fumos-game-reload-rejects-pid-reuse ()
   (let* ((root (make-temp-file "fumos-game-pid-root-" t))
          (token (make-string 64 ?a))
@@ -1769,7 +1787,8 @@
   (let* ((root (make-temp-file "fumos-game-timeout-root-" t))
          (connection
           (fumos-test-game-connection root (make-string 64 ?a)))
-         (start (current-time)) (now 0.0) callback messages)
+         (start (current-time)) (now 0.0) callback messages
+         (fumos-game-reload-timeout 10.0))
     (unwind-protect
         (cl-letf
             (((symbol-function 'process-attributes)

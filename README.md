@@ -242,7 +242,9 @@ descriptor belonging to the same PID, and attaches to the new REPL session.
 Synchronous or asynchronous errors, `C-g`/`quit`, and other nonlocal exits
 cancel that operation's descriptor polling. Only the expected
 `connection-lost` transition lets the same operation generation keep waiting
-for the replacement.
+for the replacement. The default wait is 30 seconds so larger mods can finish
+asset loading; customize `fumos-game-reload-timeout` when a project needs a
+different positive deadline.
 
 ### Connection and buffer isolation
 

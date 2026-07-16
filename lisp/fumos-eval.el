@@ -11,6 +11,11 @@
 
 (declare-function lua-mode "lua-mode")
 
+(defcustom fumos-game-reload-timeout 30.0
+  "Seconds allowed for a same-process Kristal game reload to reattach."
+  :type 'number
+  :group 'fennel-proto-repl)
+
 (defun fumos-eval--connection ()
   "Return the current FUMOS connection."
   (or (fumos-repl-current-connection)
@@ -2116,6 +2121,9 @@ Otherwise PATH is an untrusted wire path."
   "Reserve and return one token-free game reload operation."
   (unless (member mode '("temp" "save" "none"))
     (user-error "Invalid FUMOS game reload mode"))
+  (unless (and (numberp fumos-game-reload-timeout)
+               (> fumos-game-reload-timeout 0))
+    (user-error "FUMOS game reload timeout must be positive"))
   (when (fumos-connection-pending-game-reload connection)
     (user-error "A FUMOS game reload is already pending"))
   (let* ((instance (fumos-connection-instance connection))
@@ -2139,7 +2147,8 @@ Otherwise PATH is an untrusted wire path."
        :connection connection :generation generation
        :transport-generation (fumos-connection-generation connection)
        :mode mode :pid pid :root root :start-identity start-identity
-       :token-digest token-digest :deadline (+ (float-time) 10.0)))))
+       :token-digest token-digest
+       :deadline (+ (float-time) fumos-game-reload-timeout)))))
 
 (defun fumos-eval--game-operation-current-p (operation)
   "Return non-nil while OPERATION still owns its connection intent."

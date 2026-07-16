@@ -220,6 +220,8 @@ FUMOS 加载前同键的精确 binding identity。
 descriptor，然后附着新的 REPL session。同步或异步错误、`C-g`/`quit` 以及其他
 nonlocal exit 都会取消本次操作的 descriptor polling。只有预期的
 `connection-lost` transition 会让同一个 operation generation 继续等待 replacement。
+默认等待 30 秒，使资源较大的 mod 有时间完成加载；项目需要其他正数 deadline 时，
+可以自定义 `fumos-game-reload-timeout`。
 
 ### 连接与 buffer 隔离
 
