@@ -1568,7 +1568,7 @@
           (make-fumos-instance
            :project-root root :mod-id "demo" :pid 4242 :token new-token))
          (start (current-time))
-         (race nil) (attribute-read 0)
+         (race nil) (attribute-read 0) (now 0.0)
          candidates callback connected canceled)
     (unwind-protect
         (cl-letf
@@ -1577,8 +1577,9 @@
                 (cl-incf attribute-read)
                 (fumos-test-process-attributes-at
                  (if (and race (cl-evenp attribute-read))
-                     (time-add start (seconds-to-time 1))
+                    (time-add start (seconds-to-time 1))
                    start))))
+             ((symbol-function 'float-time) (lambda (&rest _) now))
              ((symbol-function 'run-at-time)
               (lambda (_delay _repeat function &rest _)
                 (setq callback function)
@@ -1603,7 +1604,9 @@
           (funcall callback)
           (should-not connected)
           (should (fumos-connection-pending-game-reload connection))
-          (setq race nil attribute-read 0)
+          ;; A valid replacement wins even when this poll is first scheduled
+          ;; at the deadline boundary.
+          (setq race nil attribute-read 0 now 31.0)
           (funcall callback)
           (should (equal (list match) connected))
           (should-not (fumos-connection-pending-game-reload connection))

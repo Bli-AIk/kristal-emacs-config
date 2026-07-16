@@ -2190,39 +2190,41 @@ Otherwise PATH is an untrusted wire path."
   (when (fumos-eval--game-operation-current-p operation)
     (condition-case nil
         (let* ((pid (fumos-game-reload-operation-pid operation))
-               (root (fumos-game-reload-operation-root operation)))
-          (if (>= (float-time)
-                  (fumos-game-reload-operation-deadline operation))
-              (when (fumos-eval--cancel-game-reload-operation operation)
-                (message "FUMOS game reload timed out waiting for PID %d" pid))
-            (let ((before (fumos-eval--process-start-identity pid)))
-              (when (and before
-                         (equal before
-                                (fumos-game-reload-operation-start-identity
-                                 operation)))
-                (let* ((candidates (fumos-discover-instances root))
-                       (after (fumos-eval--process-start-identity pid))
-                       (match
-                        (and (equal before after)
-                             (equal after
-                                    (fumos-game-reload-operation-start-identity
-                                     operation))
-                             (seq-find
-                              (lambda (candidate)
-                                (and
-                                 (= pid (fumos-instance-pid candidate))
-                                 (fumos-eval--candidate-root-matches-p
-                                  candidate root)
-                                 (fumos-eval--candidate-token-changed-p
-                                  candidate operation)))
-                              candidates))))
-                  (when (and match
-                             (fumos-eval--cancel-game-reload-operation
-                              operation))
-                    (condition-case nil
-                        (fumos-repl-connect-instance match)
-                      ((error quit)
-                       (message "FUMOS game reload reconnect failed")))))))))
+               (root (fumos-game-reload-operation-root operation))
+               (before (fumos-eval--process-start-identity pid))
+               match)
+          (when (and before
+                     (equal before
+                            (fumos-game-reload-operation-start-identity
+                             operation)))
+            (let ((candidates (fumos-discover-instances root))
+                  (after (fumos-eval--process-start-identity pid)))
+              (setq
+               match
+               (and (equal before after)
+                    (equal after
+                           (fumos-game-reload-operation-start-identity
+                            operation))
+                    (seq-find
+                     (lambda (candidate)
+                       (and
+                        (= pid (fumos-instance-pid candidate))
+                        (fumos-eval--candidate-root-matches-p candidate root)
+                        (fumos-eval--candidate-token-changed-p
+                         candidate operation)))
+                     candidates)))))
+          (cond
+           (match
+            (when (fumos-eval--cancel-game-reload-operation operation)
+              (condition-case nil
+                  (fumos-repl-connect-instance match)
+                ((error quit)
+                 (message "FUMOS game reload reconnect failed")))))
+           ((>= (float-time)
+                (fumos-game-reload-operation-deadline operation))
+            (when (fumos-eval--cancel-game-reload-operation operation)
+              (message "FUMOS game reload timed out waiting for PID %d"
+                       pid)))))
       ((error quit)
        (when (fumos-eval--cancel-game-reload-operation operation)
          (message "FUMOS game reload polling failed"))))))
