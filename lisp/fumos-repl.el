@@ -60,10 +60,13 @@
   terminal-timers terminal-deliveries game-reload-timer game-reload-generation
   linked-buffers macro-cache macro-cache-valid macro-refresh-pending
   macro-refresh-id macro-refresh-generation macro-refresh-epoch error-buffer
-  help-epoch help-pending xref-epoch xref-pending xref-cache eldoc-epoch
+  error-epoch help-epoch help-pending xref-epoch xref-pending xref-cache eldoc-epoch
   eldoc-pending completion-epoch completion-pending completion-cache)
 
 (defvar fumos-repl--connections (make-hash-table :test #'equal))
+(defvar fumos-repl--source-operations
+  (make-hash-table :test #'eq :weakness 'key)
+  "Authoritative latest source operation keyed by source buffer.")
 (defvar fumos-repl--attach-transitions (make-hash-table :test #'equal)
   "Latest public attach transition token for each canonical project root.")
 (defvar-local fumos-repl--connection nil)
@@ -298,7 +301,7 @@
    :active-request-ids nil :retry-timers nil :callback-timers nil
    :callback-deliveries (make-hash-table :test #'eql)
    :terminal-timers nil :terminal-deliveries nil
-   :game-reload-generation 0 :macro-refresh-epoch 0
+   :game-reload-generation 0 :macro-refresh-epoch 0 :error-epoch 0
    :help-epoch 0 :xref-epoch 0 :xref-cache (make-hash-table :test #'equal)
    :eldoc-epoch 0 :completion-epoch 0
    :completion-pending (make-hash-table :test #'equal)
@@ -979,10 +982,16 @@
   "Editing hooks and font-lock state captured before FUMOS ownership.")
 
 (defvar-local fumos-repl--source-link-transition nil
-  "Identity token for the source link transaction currently in flight.")
+  "Identity token for the newest source ownership operation.")
+
+(defvar-local fumos-repl--source-killing nil
+  "Non-nil after FUMOS source cleanup begins inside `kill-buffer-hook'.")
 
 (defvar fumos-repl--internal-link-target nil
   "REPL target being installed by a FUMOS source link transaction.")
+
+(defvar fumos-repl--internal-source-mode-change nil
+  "Non-nil while FUMOS itself restores proto minor-mode state.")
 
 (defvar-local fumos-repl--game-editing-owned nil
   "Non-nil when the current game REPL owns its editing configuration.")
@@ -1025,6 +1034,14 @@
      'xref-backend-functions (plist-get snapshot :xref))
     (fumos-repl--restore-local-value
      'eldoc-documentation-functions (plist-get snapshot :eldoc))))
+
+(defun fumos-repl--install-upstream-editing-state ()
+  "Install the editing hooks owned by an active ordinary proto mode."
+  (add-hook 'completion-at-point-functions
+            #'fennel-proto-repl-complete nil t)
+  (add-hook 'xref-backend-functions
+            #'fennel-proto-repl--xref-backend nil t)
+  (fennel-proto-repl--setup-eldoc))
 
 (defun fumos-repl--without-global-font-lock (value)
   "Return VALUE with dynamic `global' font lock removed in order."
@@ -1090,6 +1107,239 @@
       (setq-local fennel-proto-repl-fennel-module-name value)
     (kill-local-variable 'fennel-proto-repl-fennel-module-name)))
 
+(defun fumos-repl--latest-source-operation (source)
+  "Return the authoritative latest ownership operation for SOURCE."
+  (let ((operation (gethash source fumos-repl--source-operations)))
+    (pcase (car-safe operation)
+      ('fumos-source-link
+       (and (fumos-connection-p (nth 1 operation))
+            (eq source (nth 2 operation))
+            operation))
+      ('fumos-source-release
+       (and (plist-member (cdr operation) :target)
+            operation)))))
+
+(defun fumos-repl--replay-source-release-operation
+    (source operation enabled-upstream-mode previous-buffer previous-mode
+            previous-module-local-p previous-module-value
+            previous-editing-state)
+  "Reassert completed release OPERATION for SOURCE without stale FUMOS state."
+  (let ((state (cdr operation))
+        (stale-owner fumos-repl--source-owner))
+    (cl-labels
+        ((operation-current-p
+          ()
+          (and (eq operation
+                   (gethash source fumos-repl--source-operations))
+               (not fumos-repl--source-killing)))
+         (restart
+          ()
+          (fumos-repl--replay-latest-source-link
+           source enabled-upstream-mode previous-buffer previous-mode
+           previous-module-local-p previous-module-value
+           previous-editing-state))
+         (set-and-check
+          (symbol value)
+          (set symbol value)
+          (unless (operation-current-p)
+            (throw 'fumos-source-release-replay-superseded (restart))))
+         (restore-local-and-check
+          (symbol snapshot)
+          (fumos-repl--restore-local-value symbol snapshot)
+          (unless (operation-current-p)
+            (throw 'fumos-source-release-replay-superseded (restart))))
+         (mutate-and-check
+          (function)
+          (funcall function)
+          (unless (operation-current-p)
+            (throw 'fumos-source-release-replay-superseded (restart)))))
+      (catch 'fumos-source-release-replay-superseded
+        (when (operation-current-p)
+          (set-and-check 'fumos-repl--source-link-transition operation)
+          (set-and-check 'fumos-repl--source-owner nil)
+          (dolist (symbol
+                   '(fumos-repl--source-enabled-upstream-mode
+                     fumos-repl--source-previous-upstream-buffer
+                     fumos-repl--source-previous-upstream-mode
+                     fumos-repl--source-previous-module-local-p
+                     fumos-repl--source-previous-module-value
+                     fumos-repl--source-previous-editing-state))
+            (set-and-check symbol nil))
+          (set-and-check 'fennel-proto-repl--buffer
+                         (plist-get state :target))
+          (set-and-check 'fennel-proto-repl-minor-mode
+                         (plist-get state :mode))
+          (if (plist-get state :module-local-p)
+              (set (make-local-variable
+                    'fennel-proto-repl-fennel-module-name)
+                   (plist-get state :module-value))
+            (kill-local-variable 'fennel-proto-repl-fennel-module-name))
+          (unless (operation-current-p)
+            (throw 'fumos-source-release-replay-superseded (restart)))
+          (let ((editing (plist-get state :editing-state)))
+            (dolist (entry
+                     '((fennel-proto-repl-font-lock-dynamically . :font-lock)
+                       (completion-at-point-functions . :completion)
+                       (xref-backend-functions . :xref)
+                       (eldoc-documentation-functions . :eldoc)))
+              (restore-local-and-check
+               (car entry) (plist-get editing (cdr entry)))))
+          (when (and (plist-get state :install-upstream)
+                     fennel-proto-repl-minor-mode)
+            (mutate-and-check #'fumos-repl--install-upstream-editing-state))
+          (when (fumos-connection-p stale-owner)
+            (setf (fumos-connection-linked-buffers stale-owner)
+                  (delq source
+                        (fumos-connection-linked-buffers stale-owner)))
+            (unless (operation-current-p)
+              (throw 'fumos-source-release-replay-superseded (restart))))
+          (setf (plist-get (cdr operation) :completed) t)
+          nil)))))
+
+(defun fumos-repl--replay-latest-source-link
+    (source enabled-upstream-mode previous-buffer previous-mode
+            previous-module-local-p previous-module-value
+            previous-editing-state)
+  "Reassert SOURCE's authoritative latest link with its inherited snapshot."
+  (when (buffer-live-p source)
+    (with-current-buffer source
+      (let ((operation (fumos-repl--latest-source-operation source)))
+        (cond
+         ((eq (car-safe operation) 'fumos-source-release)
+          (fumos-repl--replay-source-release-operation
+           source operation enabled-upstream-mode previous-buffer previous-mode
+           previous-module-local-p previous-module-value
+           previous-editing-state))
+         ((eq (car-safe operation) 'fumos-source-link)
+          (let* ((operation-state (cdddr operation))
+                 (enabled-upstream-mode
+                  (plist-get operation-state :enabled))
+                 (previous-buffer
+                  (plist-get operation-state :previous-buffer))
+                 (previous-mode
+                  (plist-get operation-state :previous-mode))
+                 (previous-module-local-p
+                  (plist-get operation-state :previous-module-local-p))
+                 (previous-module-value
+                  (plist-get operation-state :previous-module-value))
+                 (previous-editing-state
+                  (plist-get operation-state :previous-editing-state))
+                 (new-owner (nth 1 operation))
+                 (repl-buffer (fumos-connection-repl-buffer new-owner))
+                 (stale-owner fumos-repl--source-owner)
+                 (previous-owners
+                  (delete-dups
+                   (delq nil
+                         (append
+                          (copy-sequence
+                           (plist-get operation-state :previous-owners))
+                          (list stale-owner))))))
+            (cl-labels
+                ((operation-current-p
+                  ()
+                  (and (eq operation
+                           (gethash source fumos-repl--source-operations))
+                       (buffer-live-p repl-buffer)
+                       (not (fumos-connection-closing new-owner))
+                       (not fumos-repl--source-killing)))
+                 (restart
+                  ()
+                  (fumos-repl--replay-latest-source-link
+                   source enabled-upstream-mode previous-buffer previous-mode
+                   previous-module-local-p previous-module-value
+                   previous-editing-state))
+                 (set-and-check
+                  (symbol value)
+                  (set symbol value)
+                  (unless (operation-current-p)
+                    (throw 'fumos-source-link-replay-superseded (restart))))
+                 (set-local-and-check
+                  (symbol value)
+                  (set (make-local-variable symbol) value)
+                  (unless (operation-current-p)
+                    (throw 'fumos-source-link-replay-superseded (restart))))
+                 (mutate-and-check
+                  (function)
+                  (funcall function)
+                  (unless (operation-current-p)
+                    (throw 'fumos-source-link-replay-superseded (restart)))))
+              (catch 'fumos-source-link-replay-superseded
+                (when (operation-current-p)
+                  ;; A variable watcher runs before its stale outer assignment.
+                  ;; Rebuild directly from the committed operation.  Re-entering
+                  ;; upstream's link path here would add a new failure window
+                  ;; after the newer operation already won.
+                  (set-and-check 'fumos-repl--source-link-transition operation)
+                  (set-and-check 'fumos-repl--source-owner new-owner)
+                  (set-and-check 'fumos-repl--source-enabled-upstream-mode
+                                 enabled-upstream-mode)
+                  (set-and-check 'fumos-repl--source-previous-upstream-buffer
+                                 previous-buffer)
+                  (set-and-check 'fumos-repl--source-previous-upstream-mode
+                                 previous-mode)
+                  (set-and-check 'fumos-repl--source-previous-module-local-p
+                                 previous-module-local-p)
+                  (set-and-check 'fumos-repl--source-previous-module-value
+                                 previous-module-value)
+                  (set-and-check 'fumos-repl--source-previous-editing-state
+                                 previous-editing-state)
+                  (set-and-check 'fennel-proto-repl--buffer repl-buffer)
+                  (set-local-and-check
+                   'fennel-proto-repl-fennel-module-name
+                   fumos-repl-fennel-module-name)
+                  (set-local-and-check
+                   'fennel-proto-repl-font-lock-dynamically
+                   (fumos-repl--without-global-font-lock
+                    fennel-proto-repl-font-lock-dynamically))
+                  (set-and-check 'fennel-proto-repl-minor-mode t)
+                  (dolist (entry
+                           `((completion-at-point-functions
+                              ,#'fennel-proto-repl-complete remove)
+                             (completion-at-point-functions
+                              ,#'fumos-completion-at-point remove)
+                             (completion-at-point-functions
+                              ,#'fumos-completion-at-point add)
+                             (xref-backend-functions
+                              ,#'fennel-proto-repl--xref-backend remove)
+                             (xref-backend-functions
+                              ,#'fumos-repl--xref-backend remove)
+                             (xref-backend-functions
+                              ,#'fumos-repl--xref-backend add)
+                             (eldoc-documentation-functions
+                              ,#'fennel-proto-repl-eldoc-fn-docstring remove)
+                             (eldoc-documentation-functions
+                              ,#'fennel-proto-repl-eldoc-var-docstring remove)
+                             (eldoc-documentation-functions
+                              ,#'fumos-eldoc-function remove)
+                             (eldoc-documentation-functions
+                              ,#'fumos-eldoc-function add)))
+                    (let ((hook (nth 0 entry))
+                          (function (nth 1 entry))
+                          (operation (nth 2 entry)))
+                      (mutate-and-check
+                       (lambda ()
+                         (if (eq operation 'add)
+                             (add-hook hook function nil t)
+                           (remove-hook hook function t))))))
+                  (dolist (previous-owner previous-owners)
+                    (unless (eq previous-owner new-owner)
+                      (setf (fumos-connection-linked-buffers previous-owner)
+                            (delq
+                             source
+                             (fumos-connection-linked-buffers previous-owner))))
+                    (unless (operation-current-p)
+                      (throw 'fumos-source-link-replay-superseded (restart))))
+                  (cl-pushnew source
+                              (fumos-connection-linked-buffers new-owner)
+                              :test #'eq)
+                  (unless (operation-current-p)
+                    (throw 'fumos-source-link-replay-superseded (restart)))
+                  (condition-case nil
+                      (fennel-proto-repl-refresh-dynamic-font-lock)
+                    ((error quit) nil))
+                  (unless (operation-current-p) (restart))
+                  new-owner))))))))))
+
 (defun fumos-repl--release-source-owner (&optional preserve-upstream)
   "Release the current source owner and optionally PRESERVE-UPSTREAM link."
   (let* ((source (current-buffer))
@@ -1101,51 +1351,192 @@
          (previous-module-local-p
           fumos-repl--source-previous-module-local-p)
          (previous-module-value fumos-repl--source-previous-module-value)
+         (enabled-upstream-mode fumos-repl--source-enabled-upstream-mode)
          (previous-editing-state
           fumos-repl--source-previous-editing-state))
-    (when (and connection
-               (fboundp 'fumos-eval--invalidate-source-tooling))
-      (fumos-eval--invalidate-source-tooling connection source))
-    ;; Clear identity before any minor-mode hook can re-enter cleanup.
-    (setq fumos-repl--source-owner nil
-          fumos-repl--source-enabled-upstream-mode nil
-          fumos-repl--source-previous-upstream-buffer nil
-          fumos-repl--source-previous-upstream-mode nil
-          fumos-repl--source-previous-module-local-p nil
-          fumos-repl--source-previous-module-value nil
-          fumos-repl--source-previous-editing-state nil
-          fumos-repl--source-link-transition nil)
     (when connection
-      (setf (fumos-connection-linked-buffers connection)
-            (delq source (fumos-connection-linked-buffers connection)))
-      (fumos-repl--restore-source-module-name
-       previous-module-local-p previous-module-value))
-    (remove-hook 'kill-buffer-hook #'fumos-repl--source-kill-cleanup t)
-    (remove-hook 'fennel-proto-repl-minor-mode-hook
-                 #'fumos-repl--source-upstream-mode-change t)
-    (when (and (not preserve-upstream)
-               (eq fennel-proto-repl--buffer owned-repl))
-      ;; Restore both halves of the snapshot.  Set the target before enabling
-      ;; upstream mode, then link it explicitly because project integration can
-      ;; otherwise choose a different REPL during the mode hook.
-      (setq fennel-proto-repl--buffer previous-buffer)
-      (condition-case nil
-          (if previous-mode
-              (progn
-                (unless fennel-proto-repl-minor-mode
-                  (fennel-proto-repl-minor-mode 1))
-                (setq fennel-proto-repl--buffer previous-buffer)
-                (when previous-buffer
-                  (fennel-proto-repl--link-buffer previous-buffer)))
-            (when fennel-proto-repl-minor-mode
-              (fennel-proto-repl-minor-mode -1))
-            (setq fennel-proto-repl--buffer previous-buffer))
-        (quit
-         (setq fennel-proto-repl--buffer previous-buffer))
-        (error
-         (setq fennel-proto-repl--buffer previous-buffer))))
-    (fumos-repl--restore-editing-state previous-editing-state)
-    connection))
+      (let* ((previous-operation
+              (gethash source fumos-repl--source-operations))
+             (ticket
+             (list 'fumos-source-release
+                   :target (if preserve-upstream
+                               fennel-proto-repl--buffer
+                             previous-buffer)
+                   :mode (if preserve-upstream
+                             fennel-proto-repl-minor-mode
+                           previous-mode)
+                   :module-local-p previous-module-local-p
+                   :module-value previous-module-value
+                   :editing-state previous-editing-state
+                   :install-upstream
+                   (and preserve-upstream enabled-upstream-mode)
+                   :completed nil))
+             completed)
+        (cl-labels
+            ((release-current-p
+              ()
+              (and (eq ticket
+                       (gethash source fumos-repl--source-operations))
+                   (eq connection fumos-repl--source-owner)))
+             (repair-new-owner
+              ()
+              (fumos-repl--replay-latest-source-link
+               source enabled-upstream-mode previous-buffer previous-mode
+               previous-module-local-p previous-module-value
+               previous-editing-state))
+             (ensure-current
+              ()
+              (unless (release-current-p)
+                ;; A stale assignment can finish after the newer link's
+                ;; variable watcher.  Re-run that newer transaction once to
+                ;; reassert its complete module/target/tooling state.
+                (repair-new-owner)
+                (throw 'fumos-source-release-superseded connection)))
+             (restore-editing-entry
+              (symbol key)
+              (fumos-repl--restore-local-value
+               symbol (plist-get previous-editing-state key))
+              (ensure-current))
+             (recover-nonlocal-release
+              ()
+              (condition-case nil
+                  (progn
+                    (when (eq ticket
+                              (gethash source fumos-repl--source-operations))
+                      (repair-new-owner))
+                    (when (eq connection fumos-repl--source-owner)
+                      (if previous-operation
+                          (puthash source previous-operation
+                                   fumos-repl--source-operations)
+                        (remhash source fumos-repl--source-operations))
+                      (when previous-operation
+                        (fumos-repl--replay-latest-source-link
+                         source enabled-upstream-mode previous-buffer
+                         previous-mode previous-module-local-p
+                         previous-module-value previous-editing-state))
+                      (when (eq connection fumos-repl--source-owner)
+                        (cl-pushnew
+                         source
+                         (fumos-connection-linked-buffers connection)
+                         :test #'eq))))
+                (quit
+                 (when (eq connection fumos-repl--source-owner)
+                   (cl-pushnew
+                    source (fumos-connection-linked-buffers connection)
+                    :test #'eq)))
+                (error
+                 (when (eq connection fumos-repl--source-owner)
+                   (cl-pushnew
+                    source (fumos-connection-linked-buffers connection)
+                    :test #'eq))))))
+          (unwind-protect
+              (prog1
+                  (catch 'fumos-source-release-superseded
+            ;; Keep the old owner and its original snapshot visible until all
+            ;; restoration steps finish.  A nested A->B link can then inherit
+            ;; that exact snapshot instead of capturing half-restored state.
+            (puthash source ticket fumos-repl--source-operations)
+            (setq fumos-repl--source-link-transition ticket)
+            (ensure-current)
+            (when (fboundp 'fumos-eval--invalidate-source-tooling)
+              (condition-case nil
+                  (fumos-eval--invalidate-source-tooling connection source)
+                (quit nil)
+                (error nil))
+              (ensure-current))
+            (setf (fumos-connection-linked-buffers connection)
+                  (delq source (fumos-connection-linked-buffers connection)))
+            (fumos-repl--restore-source-module-name
+             previous-module-local-p previous-module-value)
+            (ensure-current)
+            (when (and (not preserve-upstream)
+                       (eq fennel-proto-repl--buffer owned-repl))
+              ;; Restore both halves of the snapshot.  The internal target
+              ;; binding keeps the upstream link advice inside this release.
+              (setq fennel-proto-repl--buffer previous-buffer)
+              (ensure-current)
+              (let ((fennel-proto-repl-font-lock-dynamically nil)
+                    (fumos-repl--internal-source-mode-change t))
+                (condition-case nil
+                    (if previous-mode
+                        (progn
+                          (unless fennel-proto-repl-minor-mode
+                            (let ((fumos-repl--internal-link-target
+                                   previous-buffer))
+                              (fennel-proto-repl-minor-mode 1))
+                            (ensure-current))
+                          (setq fennel-proto-repl--buffer previous-buffer)
+                          (ensure-current)
+                          (when previous-buffer
+                            (let ((fumos-repl--internal-link-target
+                                   previous-buffer))
+                              (fennel-proto-repl--link-buffer previous-buffer))
+                            (ensure-current)))
+                      (when fennel-proto-repl-minor-mode
+                        (fennel-proto-repl-minor-mode -1)
+                        (ensure-current))
+                      (setq fennel-proto-repl--buffer previous-buffer)
+                      (ensure-current))
+                  ((error quit)
+                   (when (release-current-p)
+                     (setq fennel-proto-repl--buffer previous-buffer)))))
+              (ensure-current))
+            (when previous-editing-state
+              (restore-editing-entry
+               'fennel-proto-repl-font-lock-dynamically :font-lock)
+              (restore-editing-entry
+               'completion-at-point-functions :completion)
+              (restore-editing-entry
+               'xref-backend-functions :xref)
+              (restore-editing-entry
+               'eldoc-documentation-functions :eldoc))
+            ;; An ordinary relink can supersede FUMOS while the proto mode that
+            ;; FUMOS enabled remains active.  Only that case needs upstream's
+            ;; default hooks; a pre-existing custom snapshot stays exact.
+            (when (and preserve-upstream enabled-upstream-mode
+                       fennel-proto-repl-minor-mode)
+              (fumos-repl--install-upstream-editing-state)
+              (ensure-current))
+            ;; Variable watchers can run before each assignment takes effect.
+            ;; Keep the ticket until every observable field is cleared, and
+            ;; repair a newer owner immediately if an old write lands last.
+            (setq fumos-repl--source-owner nil)
+            (unless (eq ticket
+                        (gethash source fumos-repl--source-operations))
+              (repair-new-owner)
+              (throw 'fumos-source-release-superseded connection))
+            (dolist (symbol
+                     '(fumos-repl--source-enabled-upstream-mode
+                       fumos-repl--source-previous-upstream-buffer
+                       fumos-repl--source-previous-upstream-mode
+                       fumos-repl--source-previous-module-local-p
+                       fumos-repl--source-previous-module-value
+                       fumos-repl--source-previous-editing-state))
+              (set symbol nil)
+              (unless (eq ticket
+                          (gethash source fumos-repl--source-operations))
+                (repair-new-owner)
+                (throw 'fumos-source-release-superseded connection)))
+            (when (fumos-connection-p fumos-repl--source-owner)
+              (repair-new-owner)
+              (throw 'fumos-source-release-superseded connection))
+            ;; Publish the complete ordinary state without changing ticket
+            ;; identity.  Any older writer which resumes after this release can
+            ;; replay the ordinary operation just as precisely as a newer link.
+            (when (and (not preserve-upstream)
+                       previous-mode
+                       (buffer-live-p previous-buffer)
+                       fennel-proto-repl-minor-mode
+                       (eq previous-buffer fennel-proto-repl--buffer)
+                       (not fumos-repl--source-killing))
+              (fumos-repl--refresh-ordinary-font-lock previous-buffer))
+            (when (eq ticket
+                      (gethash source fumos-repl--source-operations))
+              (setf (plist-get (cdr ticket) :completed) t))
+                    connection)
+                (setq completed t))
+            (unless completed
+              (recover-nonlocal-release))))))))
 
 (defun fumos-repl--source-upstream-mode-change ()
   "Drop FUMOS ownership when the user disables proto minor mode."
@@ -1157,11 +1548,124 @@
           (fumos-repl--live-previous-upstream-buffer))
     (fumos-repl--release-source-owner t)))
 
+(defun fumos-repl--source-upstream-mode-advice (original &optional arg)
+  "Run ORIGINAL proto mode command, then enforce FUMOS source ownership."
+  (unwind-protect
+      (funcall original arg)
+    (unless fumos-repl--internal-source-mode-change
+      (condition-case nil
+          (fumos-repl--source-upstream-mode-change)
+        (quit nil)
+        (error nil)))))
+
+(unless (advice-member-p #'fumos-repl--source-upstream-mode-advice
+                         'fennel-proto-repl-minor-mode)
+  (advice-add 'fennel-proto-repl-minor-mode :around
+              #'fumos-repl--source-upstream-mode-advice))
+
+(defun fumos-repl--refresh-ordinary-font-lock (target)
+  "Refresh TARGET tooling only while the current source remains ordinary."
+  (let ((source (current-buffer))
+        (obtain-globals
+         (symbol-function 'fennel-proto-repl--obtain-globals))
+        (obtain-macros
+         (symbol-function 'fennel-proto-repl--obtain-macros)))
+    (cl-labels
+        ((ordinary-link-current-p
+          ()
+          (and (buffer-live-p source)
+               (buffer-live-p target)
+               (with-current-buffer source
+                 (and (not fumos-repl--source-owner)
+                      (eq target fennel-proto-repl--buffer)
+                      fennel-proto-repl-minor-mode))))
+         (guarded-query
+          (function args)
+          (if (not (eq (current-buffer) source))
+              (apply function args)
+            (unless (ordinary-link-current-p)
+              (error "Ordinary proto refresh was superseded"))
+            (prog1 (apply function args)
+              ;; A synchronous upstream query may dispatch an attach callback.
+              ;; Abort before its result can mutate a newly owned source.
+              (unless (ordinary-link-current-p)
+                (error "Ordinary proto refresh was superseded"))))))
+      (when (ordinary-link-current-p)
+        (let ((fennel-proto-repl--reloading-buffer nil))
+          (cl-letf
+              (((symbol-function 'fennel-proto-repl--obtain-globals)
+                (lambda (&rest args)
+                  (guarded-query obtain-globals args)))
+               ((symbol-function 'fennel-proto-repl--obtain-macros)
+                (lambda (&rest args)
+                  (guarded-query obtain-macros args))))
+            (fennel-proto-repl-refresh-dynamic-font-lock)))))))
+
+(defun fumos-repl--cancel-pending-source-link
+    (source operation ordinary-target)
+  "Publish ORDINARY-TARGET when it supersedes pending link OPERATION."
+  (when (eq operation (gethash source fumos-repl--source-operations))
+    (let* ((state (cdddr operation))
+           (enabled (plist-get state :enabled))
+           (previous-buffer (plist-get state :previous-buffer))
+           (previous-mode (plist-get state :previous-mode))
+           (previous-module-local-p
+            (plist-get state :previous-module-local-p))
+           (previous-module-value
+            (plist-get state :previous-module-value))
+           (previous-editing-state
+            (plist-get state :previous-editing-state))
+           (release
+            (list 'fumos-source-release
+                  :target ordinary-target
+                  :mode fennel-proto-repl-minor-mode
+                  :module-local-p previous-module-local-p
+                  :module-value previous-module-value
+                  :editing-state previous-editing-state
+                  :install-upstream enabled
+                  :completed nil)))
+      (puthash source release fumos-repl--source-operations)
+      (setq fumos-repl--source-link-transition release)
+      (fumos-repl--replay-latest-source-link
+       source enabled previous-buffer previous-mode
+       previous-module-local-p previous-module-value
+       previous-editing-state))))
+
 (defun fumos-repl--link-buffer-advice (original &optional repl-buffer)
   "Let an ordinary upstream relink supersede a stale FUMOS source owner."
-  (let ((owner fumos-repl--source-owner))
+  (let* ((source (current-buffer))
+         (source-operation
+          (gethash source fumos-repl--source-operations))
+         (pending-owner
+          (and (eq (car-safe source-operation) 'fumos-source-link)
+               (fumos-connection-p (nth 1 source-operation))
+               (nth 1 source-operation)))
+         (owner fumos-repl--source-owner)
+         (effective-owner (or owner pending-owner))
+         (owned-repl
+          (and effective-owner
+               (fumos-connection-repl-buffer effective-owner)))
+         (target (and repl-buffer (get-buffer repl-buffer)))
+         (suppress-transition-refresh
+          (and effective-owner
+               (or (null target)
+                   (and (not (eq target owned-repl))
+                        (not (eq target
+                                 fumos-repl--internal-link-target))))))
+         completed ordinary-target result)
     (unwind-protect
-        (funcall original repl-buffer)
+        ;; Upstream changes the target before refreshing font lock.  During an
+        ;; owner-to-ordinary transition that would make retained macro options
+        ;; fall through to its synchronous transport while FUMOS still owns the
+        ;; source transaction.  The restored ordinary configuration applies to
+        ;; every later explicit refresh; suppress only this transitional one.
+        (prog1
+            (setq result
+                  (if suppress-transition-refresh
+                      (let ((fennel-proto-repl-font-lock-dynamically nil))
+                        (funcall original repl-buffer))
+                    (funcall original repl-buffer)))
+          (setq completed t))
       (when (and owner
                  (eq owner fumos-repl--source-owner)
                  (not (eq fennel-proto-repl--buffer
@@ -1170,7 +1674,40 @@
                           fumos-repl--internal-link-target)))
         ;; Upstream already installed the ordinary target.  Release only the
         ;; old FUMOS bookkeeping and keep that target and minor mode intact.
-        (fumos-repl--release-source-owner t)))))
+        (setq ordinary-target fennel-proto-repl--buffer)
+        (fumos-repl--release-source-owner t))
+      (when (and (not owner)
+                 pending-owner
+                 (eq source-operation
+                     (gethash source fumos-repl--source-operations))
+                 (not (eq fennel-proto-repl--buffer owned-repl))
+                 (not (eq fennel-proto-repl--buffer
+                          fumos-repl--internal-link-target)))
+        (setq ordinary-target fennel-proto-repl--buffer)
+        (fumos-repl--cancel-pending-source-link
+         source source-operation ordinary-target)))
+    (let ((new-owner fumos-repl--source-owner))
+      (when (and (fumos-connection-p new-owner)
+                 (not (eq new-owner owner))
+                 (not (eq fennel-proto-repl--buffer
+                          (fumos-connection-repl-buffer new-owner))))
+        ;; The upstream target assignment can run a watcher which completes a
+        ;; newer A->B link before the old assignment lands.  Reassert B after
+        ;; the upstream call returns instead of leaving owner and target split.
+        (fumos-repl--replay-latest-source-link
+         (current-buffer)
+         fumos-repl--source-enabled-upstream-mode
+         fumos-repl--source-previous-upstream-buffer
+         fumos-repl--source-previous-upstream-mode
+         fumos-repl--source-previous-module-local-p
+         fumos-repl--source-previous-module-value
+         fumos-repl--source-previous-editing-state)))
+    (when (and completed ordinary-target
+               (not fumos-repl--source-owner)
+               (eq ordinary-target fennel-proto-repl--buffer)
+               fennel-proto-repl-minor-mode)
+      (fumos-repl--refresh-ordinary-font-lock ordinary-target))
+    result))
 
 (unless (advice-member-p #'fumos-repl--link-buffer-advice
                          'fennel-proto-repl--link-buffer)
@@ -1179,27 +1716,50 @@
 
 (defun fumos-repl--unlink-project-buffers (connection)
   "Remove only source-buffer links whose local owner is CONNECTION."
-  (let ((buffers (copy-sequence
-                  (fumos-connection-linked-buffers connection))))
-    (dolist (buffer buffers)
-      (when (buffer-live-p buffer)
-        (with-current-buffer buffer
-          (when (eq fumos-repl--source-owner connection)
-            (fumos-repl--release-source-owner)))))
-    ;; A source already relinked elsewhere is not touched, but any stale strong
-    ;; reference left in this connection is still deterministically released.
-    (setf (fumos-connection-linked-buffers connection) nil)))
+  ;; Clear each claimed batch before releasing it.  A reentrant stale writer can
+  ;; only append to a fresh list, which the next fixed-point pass will sweep.
+  (while (fumos-connection-linked-buffers connection)
+    (let ((buffers (copy-sequence
+                    (fumos-connection-linked-buffers connection))))
+      (setf (fumos-connection-linked-buffers connection) nil)
+      (dolist (buffer buffers)
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer
+            (when (eq fumos-repl--source-owner connection)
+              (fumos-repl--release-source-owner))))))))
 
 (defun fumos-repl-unlink-current-buffer ()
   "Unlink the current source buffer according to its local FUMOS owner."
   (fumos-repl--release-source-owner))
 
+(defun fumos-repl--kill-buffer-advice (original &optional buffer-or-name)
+  "Keep a FUMOS source closing barrier for the full ORIGINAL kill call."
+  (let ((buffer (get-buffer (or buffer-or-name (current-buffer)))))
+    (if (and (buffer-live-p buffer)
+             (buffer-local-value 'fumos-repl--source-owner buffer))
+        (with-current-buffer buffer
+          (let ((fumos-repl--source-killing t))
+            (fumos-repl--source-kill-cleanup)
+            (funcall original buffer)))
+      (funcall original buffer-or-name))))
+
+(unless (advice-member-p #'fumos-repl--kill-buffer-advice 'kill-buffer)
+  (advice-add 'kill-buffer :around #'fumos-repl--kill-buffer-advice))
+
 (defun fumos-repl--source-kill-cleanup ()
   "Release only the FUMOS link owned by the source buffer being killed."
-  (condition-case nil
-      (fumos-repl-unlink-current-buffer)
-    (quit nil)
-    (error nil)))
+  (let ((fumos-repl--source-killing t)
+        (source (current-buffer))
+        (connection fumos-repl--source-owner))
+    (unwind-protect
+        (condition-case nil
+            (fumos-repl-unlink-current-buffer)
+          (quit nil)
+          (error nil))
+      (when (fumos-connection-p connection)
+        (setf (fumos-connection-linked-buffers connection)
+              (delq source (fumos-connection-linked-buffers connection))))
+      (remhash source fumos-repl--source-operations))))
 
 (defun fumos-repl--invalidate-tooling-state (connection)
   "Invalidate every asynchronous editing query owned by CONNECTION."
@@ -1215,7 +1775,9 @@
         (1+ (or (fumos-connection-eldoc-epoch connection) 0))
         (fumos-connection-eldoc-pending connection) nil
         (fumos-connection-completion-epoch connection)
-        (1+ (or (fumos-connection-completion-epoch connection) 0)))
+        (1+ (or (fumos-connection-completion-epoch connection) 0))
+        (fumos-connection-error-epoch connection)
+        (1+ (or (fumos-connection-error-epoch connection) 0)))
   (when (hash-table-p (fumos-connection-xref-cache connection))
     (clrhash (fumos-connection-xref-cache connection)))
   (when (hash-table-p (fumos-connection-completion-pending connection))
@@ -1765,8 +2327,7 @@
    :target fennel-proto-repl--buffer
    :mode fennel-proto-repl-minor-mode
    :transition fumos-repl--source-link-transition
-   :kill-hooks kill-buffer-hook
-   :mode-hooks fennel-proto-repl-minor-mode-hook
+   :operation (gethash (current-buffer) fumos-repl--source-operations)
    :editing-state (fumos-repl--capture-editing-state)
    :links (mapcar (lambda (value)
                     (cons value
@@ -1774,120 +2335,307 @@
                            (fumos-connection-linked-buffers value))))
                   (delete-dups (delq nil (copy-sequence connections))))))
 
-(defun fumos-repl--restore-source-link-snapshot (snapshot)
-  "Restore the exact source-link state captured in SNAPSHOT."
-  (dolist (entry (plist-get snapshot :links))
-    (setf (fumos-connection-linked-buffers (car entry)) (cdr entry)))
-  (setq fumos-repl--source-owner (plist-get snapshot :owner)
-        fumos-repl--source-enabled-upstream-mode
-        (plist-get snapshot :enabled)
-        fumos-repl--source-previous-upstream-buffer
-        (plist-get snapshot :previous-buffer)
-        fumos-repl--source-previous-upstream-mode
-        (plist-get snapshot :previous-mode)
-        fumos-repl--source-previous-module-local-p
-        (plist-get snapshot :previous-module-local-p)
-        fumos-repl--source-previous-module-value
-        (plist-get snapshot :previous-module-value)
-        fumos-repl--source-previous-editing-state
-        (plist-get snapshot :previous-editing-state)
-        fennel-proto-repl--buffer (plist-get snapshot :target)
-        fennel-proto-repl-minor-mode (plist-get snapshot :mode)
-        fumos-repl--source-link-transition
-        (plist-get snapshot :transition)
-        kill-buffer-hook (plist-get snapshot :kill-hooks)
-        fennel-proto-repl-minor-mode-hook (plist-get snapshot :mode-hooks))
-  (fumos-repl--restore-editing-state (plist-get snapshot :editing-state))
-  (fumos-repl--restore-source-module-name
-   (plist-get snapshot :module-local-p)
-   (plist-get snapshot :module-value)))
+(defun fumos-repl--restore-source-link-snapshot
+    (snapshot ticket source enabled-upstream-mode previous-buffer previous-mode
+              previous-module-local-p previous-module-value
+              previous-editing-state)
+  "Restore SNAPSHOT while TICKET remains SOURCE's newest operation."
+  (cl-labels
+      ((operation-current-p
+        ()
+        (and (buffer-live-p source)
+             (eq ticket (gethash source fumos-repl--source-operations))))
+       (restart
+        ()
+        (fumos-repl--replay-latest-source-link
+         source enabled-upstream-mode previous-buffer previous-mode
+         previous-module-local-p previous-module-value
+         previous-editing-state))
+       (ensure-current
+        ()
+        (unless (operation-current-p)
+          (throw 'fumos-source-link-rollback-superseded (restart))))
+       (set-and-check
+        (symbol value)
+        (set symbol value)
+        (ensure-current))
+       (restore-local-and-check
+        (symbol local-snapshot)
+        (fumos-repl--restore-local-value symbol local-snapshot)
+        (ensure-current)))
+    (catch 'fumos-source-link-rollback-superseded
+      (when (operation-current-p)
+        (dolist (entry (plist-get snapshot :links))
+          (setf (fumos-connection-linked-buffers (car entry)) (cdr entry))
+          (ensure-current))
+        (set-and-check 'fumos-repl--source-owner
+                       (plist-get snapshot :owner))
+        (set-and-check 'fumos-repl--source-enabled-upstream-mode
+                       (plist-get snapshot :enabled))
+        (set-and-check 'fumos-repl--source-previous-upstream-buffer
+                       (plist-get snapshot :previous-buffer))
+        (set-and-check 'fumos-repl--source-previous-upstream-mode
+                       (plist-get snapshot :previous-mode))
+        (set-and-check 'fumos-repl--source-previous-module-local-p
+                       (plist-get snapshot :previous-module-local-p))
+        (set-and-check 'fumos-repl--source-previous-module-value
+                       (plist-get snapshot :previous-module-value))
+        (set-and-check 'fumos-repl--source-previous-editing-state
+                       (plist-get snapshot :previous-editing-state))
+        (set-and-check 'fennel-proto-repl--buffer
+                       (plist-get snapshot :target))
+        (set-and-check 'fennel-proto-repl-minor-mode
+                       (plist-get snapshot :mode))
+        (let ((editing (plist-get snapshot :editing-state)))
+          (dolist (entry
+                   '((fennel-proto-repl-font-lock-dynamically . :font-lock)
+                     (completion-at-point-functions . :completion)
+                     (xref-backend-functions . :xref)
+                     (eldoc-documentation-functions . :eldoc)))
+            (restore-local-and-check
+             (car entry) (plist-get editing (cdr entry)))))
+        (if (plist-get snapshot :module-local-p)
+            (set (make-local-variable
+                  'fennel-proto-repl-fennel-module-name)
+                 (plist-get snapshot :module-value))
+          (kill-local-variable 'fennel-proto-repl-fennel-module-name))
+        (ensure-current)
+        ;; Restore the local mirror before publishing the previous authoritative
+        ;; operation.  A watcher which starts a newer operation changes the hash
+        ;; and is detected before this rollback can overwrite that intent.
+        (setq fumos-repl--source-link-transition
+              (plist-get snapshot :transition))
+        (ensure-current)
+        (let ((previous-operation (plist-get snapshot :operation)))
+          (if previous-operation
+              (puthash source previous-operation
+                       fumos-repl--source-operations)
+            (remhash source fumos-repl--source-operations)))))))
 
 (defun fumos-repl--link-buffer-to-connection (connection buffer)
   "Transactionally relink BUFFER to CONNECTION."
-  (with-current-buffer buffer
-    (let* ((old-owner fumos-repl--source-owner)
+  (when (and (buffer-live-p buffer)
+             (not (fumos-connection-closing connection)))
+    (with-current-buffer buffer
+      (unless fumos-repl--source-killing
+        (let* ((previous-operation
+                (gethash buffer fumos-repl--source-operations))
+           (previous-link-p
+            (eq (car-safe previous-operation) 'fumos-source-link))
+           (previous-release-p
+            (eq (car-safe previous-operation) 'fumos-source-release))
+           (previous-operation-state
+            (cond
+             (previous-link-p (cdddr previous-operation))
+             (previous-release-p (cdr previous-operation))))
+           (old-owner
+            (or fumos-repl--source-owner
+                (and previous-link-p
+                     (car (plist-get previous-operation-state
+                                     :previous-owners)))))
            (previous-buffer
-            (if old-owner
-                fumos-repl--source-previous-upstream-buffer
-              (and fennel-proto-repl--buffer
-                   (get-buffer fennel-proto-repl--buffer))))
+            (cond
+             (previous-link-p
+              (plist-get previous-operation-state :previous-buffer))
+             (previous-release-p
+              (if (plist-get previous-operation-state :completed)
+                  (and fennel-proto-repl--buffer
+                       (get-buffer fennel-proto-repl--buffer))
+                (plist-get previous-operation-state :target)))
+             (old-owner fumos-repl--source-previous-upstream-buffer)
+             (t (and fennel-proto-repl--buffer
+                     (get-buffer fennel-proto-repl--buffer)))))
            (previous-mode
-            (if old-owner
-                fumos-repl--source-previous-upstream-mode
-              (and fennel-proto-repl-minor-mode t)))
+            (cond
+             (previous-link-p
+              (plist-get previous-operation-state :previous-mode))
+             (previous-release-p
+              (if (plist-get previous-operation-state :completed)
+                  (and fennel-proto-repl-minor-mode t)
+                (plist-get previous-operation-state :mode)))
+             (old-owner fumos-repl--source-previous-upstream-mode)
+             (t (and fennel-proto-repl-minor-mode t))))
            (previous-module-local-p
-            (if old-owner
-                fumos-repl--source-previous-module-local-p
-              (local-variable-p
-               'fennel-proto-repl-fennel-module-name)))
+            (cond
+             (previous-link-p
+              (plist-get previous-operation-state
+                         :previous-module-local-p))
+             (previous-release-p
+              (if (plist-get previous-operation-state :completed)
+                  (local-variable-p
+                   'fennel-proto-repl-fennel-module-name)
+                (plist-get previous-operation-state :module-local-p)))
+             (old-owner fumos-repl--source-previous-module-local-p)
+             (t (local-variable-p
+                 'fennel-proto-repl-fennel-module-name))))
            (previous-module-value
-            (if old-owner
-                fumos-repl--source-previous-module-value
-              fennel-proto-repl-fennel-module-name))
+            (cond
+             (previous-link-p
+              (plist-get previous-operation-state :previous-module-value))
+             (previous-release-p
+              (if (plist-get previous-operation-state :completed)
+                  fennel-proto-repl-fennel-module-name
+                (plist-get previous-operation-state :module-value)))
+             (old-owner fumos-repl--source-previous-module-value)
+             (t fennel-proto-repl-fennel-module-name)))
            (previous-editing-state
-            (if old-owner
-                fumos-repl--source-previous-editing-state
-              (fumos-repl--capture-editing-state)))
+            (cond
+             (previous-link-p
+              (plist-get previous-operation-state :previous-editing-state))
+             (previous-release-p
+              (if (plist-get previous-operation-state :completed)
+                  (fumos-repl--capture-editing-state)
+                (plist-get previous-operation-state :editing-state)))
+             (old-owner fumos-repl--source-previous-editing-state)
+             (t (fumos-repl--capture-editing-state))))
            (repl-buffer (fumos-connection-repl-buffer connection))
-           (ticket (list 'fumos-source-link connection buffer))
+           (ticket
+            (list 'fumos-source-link connection buffer
+                  :previous-owners
+                  (delete-dups
+                   (delq nil
+                         (append
+                          (and previous-link-p
+                               (copy-sequence
+                                (plist-get previous-operation-state
+                                           :previous-owners)))
+                          (list old-owner))))
+                  :enabled (not previous-mode)
+                  :previous-buffer previous-buffer
+                  :previous-mode previous-mode
+                  :previous-module-local-p previous-module-local-p
+                  :previous-module-value previous-module-value
+                  :previous-editing-state previous-editing-state))
+           (previous-owners
+            (plist-get (cdddr ticket) :previous-owners))
            (snapshot
             (fumos-repl--source-link-snapshot
-             (list old-owner connection)))
-           failure superseded)
-      (setq fumos-repl--source-link-transition ticket
-            fennel-proto-repl--buffer repl-buffer)
-      (setq-local fennel-proto-repl-fennel-module-name
-                  fumos-repl-fennel-module-name)
-      ;; Upstream mode enable and link both refresh font lock synchronously.
-      ;; Remove only the global query before either path can run.
-      (setq-local
-       fennel-proto-repl-font-lock-dynamically
-       (fumos-repl--without-global-font-lock
-        fennel-proto-repl-font-lock-dynamically))
-      (condition-case caught
-          (let ((fumos-repl--internal-link-target repl-buffer))
-            (unless fennel-proto-repl-minor-mode
-              (fennel-proto-repl-minor-mode 1))
-            (unless (eq ticket fumos-repl--source-link-transition)
-              (setq superseded t))
-            (unless superseded
-              (fennel-proto-repl--link-buffer repl-buffer)
-              (unless (eq ticket fumos-repl--source-link-transition)
-                (setq superseded t)))
-            (unless superseded
-              (fumos-repl--install-owned-editing-state)
-              (unless (eq ticket fumos-repl--source-link-transition)
-                (setq superseded t))))
-        ((error quit) (setq failure caught)))
+             (append previous-owners (list connection))))
+               failure superseded)
+      (puthash buffer ticket fumos-repl--source-operations)
+      (cl-labels
+          ((setup-current-p
+            ()
+            (and (eq ticket
+                     (gethash buffer fumos-repl--source-operations))
+                 (not (fumos-connection-closing connection))
+                 (not fumos-repl--source-killing)))
+           (ensure-setup-current
+            ()
+            (unless (setup-current-p) (setq superseded t))))
+        (condition-case caught
+            (progn
+              (setq fumos-repl--source-link-transition ticket)
+              (ensure-setup-current)
+              (unless superseded
+                (setq fennel-proto-repl--buffer repl-buffer)
+                (ensure-setup-current))
+              (unless superseded
+                (setq-local fennel-proto-repl-fennel-module-name
+                            fumos-repl-fennel-module-name)
+                (ensure-setup-current))
+              ;; Upstream mode enable and link both refresh font lock
+              ;; synchronously.  Remove only the global query before either
+              ;; path can run.
+              (unless superseded
+                (setq-local
+                 fennel-proto-repl-font-lock-dynamically
+                 (fumos-repl--without-global-font-lock
+                  fennel-proto-repl-font-lock-dynamically))
+                (ensure-setup-current))
+              (unless superseded
+                (let ((fumos-repl--internal-link-target repl-buffer))
+                  (unless fennel-proto-repl-minor-mode
+                    (fennel-proto-repl-minor-mode 1))
+                  (ensure-setup-current)
+                  (unless superseded
+                    (fennel-proto-repl--link-buffer repl-buffer)
+                    (ensure-setup-current))
+                  (unless superseded
+                    (fumos-repl--install-owned-editing-state)
+                    (ensure-setup-current)))))
+          ((error quit) (setq failure caught))))
       (cond
        (failure
-        (when (eq ticket fumos-repl--source-link-transition)
-          (fumos-repl--restore-source-link-snapshot snapshot))
+        (if (eq ticket (gethash buffer fumos-repl--source-operations))
+            (fumos-repl--restore-source-link-snapshot
+             snapshot ticket buffer (not previous-mode) previous-buffer
+             previous-mode previous-module-local-p previous-module-value
+             previous-editing-state)
+          (fumos-repl--replay-latest-source-link
+           buffer (not previous-mode) previous-buffer previous-mode
+           previous-module-local-p previous-module-value
+           previous-editing-state))
         (signal (car failure) (cdr failure)))
        (superseded
         ;; A nested link or teardown is newer intent and owns final state.
+        (if (eq ticket (gethash buffer fumos-repl--source-operations))
+            (fumos-repl--restore-source-link-snapshot
+             snapshot ticket buffer (not previous-mode) previous-buffer
+             previous-mode previous-module-local-p previous-module-value
+             previous-editing-state)
+          (fumos-repl--replay-latest-source-link
+           buffer (not previous-mode) previous-buffer previous-mode
+           previous-module-local-p previous-module-value
+           previous-editing-state))
         fumos-repl--source-owner)
        (t
-        (when old-owner
-          (setf (fumos-connection-linked-buffers old-owner)
-                (delq buffer
-                      (fumos-connection-linked-buffers old-owner))))
-        (setq fumos-repl--source-owner connection
-              fumos-repl--source-enabled-upstream-mode (not previous-mode)
-              fumos-repl--source-previous-upstream-buffer previous-buffer
-              fumos-repl--source-previous-upstream-mode previous-mode
-              fumos-repl--source-previous-module-local-p
-              previous-module-local-p
-              fumos-repl--source-previous-module-value previous-module-value
-              fumos-repl--source-previous-editing-state
-              previous-editing-state
-              fumos-repl--source-link-transition nil)
-        (cl-pushnew buffer
-                    (fumos-connection-linked-buffers connection) :test #'eq)
-        (add-hook 'kill-buffer-hook #'fumos-repl--source-kill-cleanup nil t)
-        (add-hook 'fennel-proto-repl-minor-mode-hook
-                  #'fumos-repl--source-upstream-mode-change nil t)
-        connection)))))
+        (cl-labels
+            ((commit-current-p
+              ()
+              (and (eq ticket
+                       (gethash buffer fumos-repl--source-operations))
+                   (buffer-live-p buffer)
+                   (not (fumos-connection-closing connection))
+                   (not fumos-repl--source-killing)))
+             (abort-commit
+              ()
+              (if (eq ticket
+                      (gethash buffer fumos-repl--source-operations))
+                  (fumos-repl--restore-source-link-snapshot
+                   snapshot ticket buffer (not previous-mode) previous-buffer
+                   previous-mode previous-module-local-p previous-module-value
+                   previous-editing-state)
+                (fumos-repl--replay-latest-source-link
+                 buffer (not previous-mode) previous-buffer previous-mode
+                 previous-module-local-p previous-module-value
+                 previous-editing-state))
+              (throw 'fumos-source-link-commit-superseded
+                     fumos-repl--source-owner))
+             (ensure-commit-current
+              ()
+              (unless (commit-current-p) (abort-commit))))
+          (catch 'fumos-source-link-commit-superseded
+            (ensure-commit-current)
+            (dolist (previous-owner previous-owners)
+              (unless (eq previous-owner connection)
+                (setf (fumos-connection-linked-buffers previous-owner)
+                      (delq
+                       buffer
+                       (fumos-connection-linked-buffers previous-owner))))
+              (ensure-commit-current))
+            (setq fumos-repl--source-owner connection)
+            (ensure-commit-current)
+            (setq fumos-repl--source-enabled-upstream-mode
+                  (not previous-mode))
+            (ensure-commit-current)
+            (setq fumos-repl--source-previous-upstream-buffer previous-buffer)
+            (ensure-commit-current)
+            (setq fumos-repl--source-previous-upstream-mode previous-mode)
+            (ensure-commit-current)
+            (setq fumos-repl--source-previous-module-local-p
+                  previous-module-local-p)
+            (ensure-commit-current)
+            (setq fumos-repl--source-previous-module-value
+                  previous-module-value)
+            (ensure-commit-current)
+            (setq fumos-repl--source-previous-editing-state
+                  previous-editing-state)
+            (ensure-commit-current)
+            (cl-pushnew buffer
+                        (fumos-connection-linked-buffers connection) :test #'eq)
+            (ensure-commit-current)
+            connection)))))))))
 
 (defun fumos-repl-link-current-buffer ()
   "Link the current ready FUMOS source buffer and upstream hooks."

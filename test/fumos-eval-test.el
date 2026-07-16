@@ -1916,6 +1916,673 @@
                            (point-max))))
       found)))
 
+(ert-deftest fumos-error-buffers-are-owned-per-connection-generation ()
+  (fumos-test-with-two-ready-connections
+      (first first-server second second-server)
+    (let* ((first-file (expand-file-name "scripts/foo.fnl" first-root))
+           (second-file (expand-file-name "scripts/foo.fnl" second-root))
+           (first-source nil)
+           (second-source nil)
+           (first-error nil)
+           (second-error nil)
+           (unrelated (generate-new-buffer " *fumos-unrelated-errors*")))
+      (unwind-protect
+          (progn
+            (dolist (file (list first-file second-file))
+              (make-directory (file-name-directory file) t)
+              (with-temp-file file
+                (insert "(local x 1)\n(+ x missing)\n")))
+            (setq first-source (find-file-noselect first-file)
+                  second-source (find-file-noselect second-file))
+            (with-current-buffer unrelated (compilation-mode))
+            (cl-mapc
+             (lambda (source connection)
+               (with-current-buffer source
+                 (unless (eq major-mode 'fennel-mode) (fennel-mode))
+                 (setq-local fumos-repl--connection connection)
+                 (fumos-repl--link-buffer-to-connection connection source)))
+             (list first-source second-source) (list first second))
+            (setf
+             (fumos-test-server-handler first-server)
+             (lambda (state client line)
+               (when (fumos-test-eval-request-p line)
+                 (fumos-test-send-source-error
+                  state client line
+                  "mods/demo/scripts/foo.fnl:2:2: first failure"
+                  "mods/demo/scripts/foo.fnl:1:1: in first chunk")))
+             (fumos-test-server-handler second-server)
+             (lambda (state client line)
+               (when (fumos-test-eval-request-p line)
+                 (fumos-test-send-source-error
+                  state client line
+                  "mods/demo/scripts/foo.fnl:2:2: second failure"
+                  "mods/demo/scripts/foo.fnl:1:1: in second chunk"))))
+            (with-current-buffer first-source
+              (should (integerp (fumos-eval-buffer))))
+            (with-current-buffer second-source
+              (should (integerp (fumos-eval-buffer))))
+            (fumos-test-assert-eval-settled first)
+            (fumos-test-assert-eval-settled second)
+            (setq first-error (fumos-connection-error-buffer first)
+                  second-error (fumos-connection-error-buffer second))
+            (should (buffer-live-p first-error))
+            (should (buffer-live-p second-error))
+            (should-not (eq first-error second-error))
+            (cl-mapc
+             (lambda (buffer connection root)
+               (should (eq connection
+                           (buffer-local-value
+                            'fumos-compilation--owner buffer)))
+               (should (eql (fumos-connection-generation connection)
+                            (buffer-local-value
+                             'fumos-compilation--generation buffer)))
+               (should
+                (equal (file-name-as-directory (file-truename root))
+                       (buffer-local-value 'fumos-compilation--root buffer))))
+             (list first-error second-error)
+             (list first second)
+             (list first-root second-root))
+            (let ((next-error-last-buffer second-error))
+              (switch-to-buffer first-source)
+              (fumos-next-error)
+              (should (eq first-source (window-buffer (selected-window))))
+              (should (= 2 (line-number-at-pos (window-point))))
+              (should (= 1 (save-excursion
+                             (goto-char (window-point))
+                             (- (point) (line-beginning-position)))))
+              (fumos-next-error)
+              (fumos-previous-error)
+              (should (eq first-source
+                          (window-buffer (selected-window)))))
+            (let ((next-error-last-buffer unrelated))
+              (switch-to-buffer second-source)
+              (fumos-next-error)
+              (should (eq second-source (window-buffer (selected-window))))
+              (should (= 2 (line-number-at-pos (window-point))))
+              (should (= 1 (save-excursion
+                             (goto-char (window-point))
+                             (- (point) (line-beginning-position)))))
+              (fumos-next-error)
+              (fumos-previous-error)
+              (should (eq second-source
+                          (window-buffer (selected-window))))))
+        (dolist (buffer (list first-source second-source
+                              first-error second-error unrelated))
+          (when (buffer-live-p buffer)
+            (with-current-buffer buffer (set-buffer-modified-p nil))
+            (kill-buffer buffer)))))))
+
+(ert-deftest fumos-error-old-generation-and-dead-source-are-noops ()
+  (fumos-test-with-replacement-servers
+      (old replacement old-server new-server)
+    (let* ((file (expand-file-name "scripts/foo.fnl" root))
+           (source nil)
+           (original-run-at-time (symbol-function 'run-at-time))
+           (fennel-proto-repl-error-buffer-action nil)
+           old-line old-id old-call old-timer old-error-name
+           new-line new-id new-error new-error-text
+           dead-line dead-call dead-timer)
+      (unwind-protect
+          (progn
+            (make-directory (file-name-directory file) t)
+            (with-temp-file file (insert "(+ 1 missing)\n"))
+            (setq source (find-file-noselect file))
+            (with-current-buffer source
+              (unless (eq major-mode 'fennel-mode) (fennel-mode))
+              (setq-local fumos-repl--connection old)
+              (fumos-repl--link-buffer-to-connection old source))
+            (setf
+             (fumos-test-server-handler old-server)
+             (lambda (_state _client line)
+               (when (fumos-test-eval-request-p line) (setq old-line line))))
+            (with-current-buffer source
+              (should (integerp (fumos-eval-buffer))))
+            (should (fumos-test-wait-until (lambda () old-line)))
+            (setq old-id
+                  (plist-get (fumos-test-read-eval-request old-line) :id)
+                  old-error-name (fumos-eval--error-buffer-name old))
+            (cl-letf
+                (((symbol-function 'run-at-time)
+                  (lambda (delay repeat callback &rest arguments)
+                    (if (and (equal delay 0) (null repeat) (null old-call))
+                        (progn
+                          (setq old-timer
+                                (funcall original-run-at-time
+                                         3600 nil #'ignore)
+                                old-call (cons callback arguments))
+                          old-timer)
+                      (apply original-run-at-time
+                             delay repeat callback arguments)))))
+              (fumos-test-send-source-error
+               old-server (fumos-test-server-client old-server) old-line
+               "mods/demo/scripts/foo.fnl:1:2: old failure"
+               "mods/demo/scripts/foo.fnl:1:2: in old chunk")
+              (should (fumos-test-wait-until (lambda () old-call))))
+            (should (memq old-timer
+                          (fumos-connection-callback-timers old)))
+            (setq replacement
+                  (fumos-repl-connect-instance
+                   (fumos-test-instance-for-server
+                    new-server 4242 root "demo" (make-string 64 ?b))))
+            (should
+             (fumos-test-wait-until
+              (lambda ()
+                (and (eq 'ready (fumos-connection-state replacement))
+                     (fumos-connection-macro-cache-valid replacement)))))
+            (should-not (get-buffer old-error-name))
+            (should-not (fumos-connection-callback-timers old))
+            (should (hash-table-empty-p
+                     (fumos-repl--callback-delivery-table old)))
+            (with-current-buffer source
+              (setq-local fumos-repl--connection replacement)
+              (fumos-repl--link-buffer-to-connection replacement source))
+            (setf
+             (fumos-test-server-handler new-server)
+             (lambda (state client line)
+               (when (fumos-test-eval-request-p line)
+                 (setq new-line line)
+                 (fumos-test-send-source-error
+                  state client line
+                  "mods/demo/scripts/foo.fnl:1:2: replacement failure"
+                  "mods/demo/scripts/foo.fnl:1:2: in replacement chunk"))))
+            (with-current-buffer source
+              (should (integerp (fumos-eval-buffer))))
+            (fumos-test-assert-eval-settled replacement)
+            (setq new-id
+                  (plist-get (fumos-test-read-eval-request new-line) :id)
+                  new-error (fumos-connection-error-buffer replacement)
+                  new-error-text
+                  (with-current-buffer new-error
+                    (buffer-substring-no-properties
+                     (point-min) (point-max))))
+            (should (= old-id new-id))
+            (should (buffer-live-p new-error))
+            (should-not (equal old-error-name (buffer-name new-error)))
+            (let ((window (selected-window))
+                  (shown (window-buffer (selected-window))))
+              ;; Emulate an already dequeued timer after cancel-timer returned.
+              (apply (car old-call) (cdr old-call))
+              (should (eq window (selected-window)))
+              (should (eq shown (window-buffer window))))
+            (should (eq new-error
+                        (fumos-connection-error-buffer replacement)))
+            (should
+             (equal new-error-text
+                    (with-current-buffer new-error
+                      (buffer-substring-no-properties
+                       (point-min) (point-max)))))
+            (should-not (get-buffer old-error-name))
+            (setf
+             (fumos-test-server-handler new-server)
+             (lambda (_state _client line)
+               (when (fumos-test-eval-request-p line) (setq dead-line line))))
+            (with-current-buffer source
+              (should (integerp (fumos-eval-buffer))))
+            (should (fumos-test-wait-until (lambda () dead-line)))
+            (cl-letf
+                (((symbol-function 'run-at-time)
+                  (lambda (delay repeat callback &rest arguments)
+                    (if (and (equal delay 0) (null repeat) (null dead-call))
+                        (progn
+                          (setq dead-timer
+                                (funcall original-run-at-time
+                                         3600 nil #'ignore)
+                                dead-call (cons callback arguments))
+                          dead-timer)
+                      (apply original-run-at-time
+                             delay repeat callback arguments)))))
+              (fumos-test-send-source-error
+               new-server (fumos-test-server-client new-server) dead-line
+               "mods/demo/scripts/foo.fnl:1:2: dead source failure"
+               "mods/demo/scripts/foo.fnl:1:2: in dead source")
+              (should (fumos-test-wait-until (lambda () dead-call))))
+            (kill-buffer source)
+            (let ((window (selected-window))
+                  (shown (window-buffer (selected-window))))
+              (apply (car dead-call) (cdr dead-call))
+              (should (eq window (selected-window)))
+              (should (eq shown (window-buffer window))))
+            (fumos-test-assert-eval-settled replacement)
+            (should
+             (equal new-error-text
+                    (with-current-buffer new-error
+                      (buffer-substring-no-properties
+                       (point-min) (point-max)))))
+            (should (eq new-error
+                        (fumos-connection-error-buffer replacement))))
+        (dolist (timer (list old-timer dead-timer))
+          (when (timerp timer) (cancel-timer timer)))
+        (when (buffer-live-p source)
+          (with-current-buffer source (set-buffer-modified-p nil))
+          (kill-buffer source))
+        (when (buffer-live-p new-error) (kill-buffer new-error))))))
+
+(ert-deftest fumos-error-mode-hook-reentry-cannot-commit-stale-generation ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (erase-buffer)
+    (insert "(+ 1 missing)\n")
+    (let ((name (fumos-eval--error-buffer-name connection))
+          (fennel-proto-repl-error-buffer-action 'show)
+          hook-ran displayed)
+      (unwind-protect
+          (progn
+            (setf
+             (fumos-test-server-handler server)
+             (lambda (state client line)
+               (when (fumos-test-eval-request-p line)
+                 (fumos-test-send-source-error
+                  state client line
+                  "mods/demo/scripts/foo.fnl:1:2: hook failure"
+                  "mods/demo/scripts/foo.fnl:1:2: in hook chunk"))))
+            (cl-letf (((symbol-function 'display-buffer)
+                       (lambda (&rest _)
+                         (setq displayed t))))
+              (let ((fumos-compilation-mode-hook
+                     (list
+                      (lambda ()
+                        (setq hook-ran t)
+                        (fumos-repl--mark-disconnected
+                         connection "error mode hook teardown")))))
+                (should (integerp (fumos-eval-buffer)))
+                (should (fumos-test-wait-until (lambda () hook-ran)))))
+            (fumos-test-assert-eval-settled connection)
+            (should (eq 'disconnected (fumos-connection-state connection)))
+            (should-not displayed)
+            (should-not (fumos-connection-error-buffer connection))
+            (should-not (get-buffer name)))
+        (when-let* ((buffer (get-buffer name)))
+          (kill-buffer buffer))))))
+
+(ert-deftest fumos-error-base-name-collision-reuses-name-without-leak ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (erase-buffer)
+    (insert "(+ 1 missing)\n")
+    (let* ((name (fumos-eval--error-buffer-name connection))
+           (foreign (get-buffer-create name))
+           (fennel-proto-repl-error-buffer-action nil)
+           first second first-name second-name)
+      (unwind-protect
+          (progn
+            (with-current-buffer foreign
+              (text-mode)
+              (insert "foreign sentinel"))
+            (setf
+             (fumos-test-server-handler server)
+             (lambda (state client line)
+               (when (fumos-test-eval-request-p line)
+                 (fumos-test-send-source-error
+                  state client line
+                  "mods/demo/scripts/foo.fnl:1:2: repeated failure" nil))))
+            (dotimes (index 2)
+              (should (integerp (fumos-eval-buffer)))
+              (fumos-test-assert-eval-settled connection)
+              (if (= index 0)
+                  (setq first (fumos-connection-error-buffer connection)
+                        first-name (buffer-name first))
+                (setq second (fumos-connection-error-buffer connection)
+                      second-name (buffer-name second))))
+            (should (buffer-live-p foreign))
+            (should (eq 'text-mode (buffer-local-value 'major-mode foreign)))
+            (should
+             (equal "foreign sentinel"
+                    (with-current-buffer foreign
+                      (buffer-substring-no-properties
+                       (point-min) (point-max)))))
+            (should-not (buffer-live-p first))
+            (should (buffer-live-p second))
+            (should-not (eq first second))
+            (should (equal first-name second-name))
+            (should-not (eq foreign second))
+            (should-not (equal name second-name)))
+        (dolist (buffer (list foreign first second))
+          (when (buffer-live-p buffer)
+            (with-current-buffer buffer (set-buffer-modified-p nil))
+            (kill-buffer buffer)))))))
+
+(ert-deftest fumos-error-nested-mode-hook-newer-transaction-wins ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (let* ((context (fumos-eval--connection-context connection))
+           (name (fumos-eval--error-buffer-name connection))
+           (fennel-proto-repl-error-buffer-action nil)
+           hook-ran inner outer)
+      (unwind-protect
+          (progn
+            (let ((fumos-compilation-mode-hook
+                   (list
+                    (lambda ()
+                      (unless hook-ran
+                        (setq hook-ran t
+                              inner
+                              (fumos-error-handler
+                               "runtime" "inner newer failure" nil
+                               context)))))))
+              (setq outer
+                    (fumos-error-handler
+                     "runtime" "outer older failure" nil context)))
+            (should hook-ran)
+            (should-not outer)
+            (should (buffer-live-p inner))
+            (should (eq inner (fumos-connection-error-buffer connection)))
+            (let ((text
+                   (with-current-buffer inner
+                     (buffer-substring-no-properties
+                      (point-min) (point-max)))))
+              (should (string-search "inner newer failure" text))
+              (should-not (string-search "outer older failure" text)))
+            (should (equal name (buffer-name inner))))
+        (dolist (buffer (buffer-list))
+          (when (and (buffer-live-p buffer)
+                     (string-prefix-p name (buffer-name buffer)))
+            (kill-buffer buffer)))))))
+
+(ert-deftest fumos-error-staging-protects-newer-variable-watcher-error ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (let* ((context (fumos-eval--connection-context connection))
+           (fennel-proto-repl-error-buffer-action nil)
+           (baseline
+            (fumos-error-handler
+             "runtime" "baseline failure" nil context))
+           watcher watcher-ran inner outer)
+      (unwind-protect
+          (progn
+            (setq
+             watcher
+             (lambda (_symbol _new-value operation where)
+               (when (and (eq operation 'set) (bufferp where)
+                          (not watcher-ran))
+                 (setq watcher-ran t)
+                 (remove-variable-watcher
+                  'fumos-compilation--owner watcher)
+                 (setq inner
+                       (fumos-error-handler
+                        "runtime" "watcher newer failure" nil context)))))
+            (add-variable-watcher 'fumos-compilation--owner watcher)
+            (setq outer
+                  (fumos-error-handler
+                   "runtime" "watcher older failure" nil context))
+            (should watcher-ran)
+            (should-not outer)
+            (should-not (buffer-live-p baseline))
+            (should (buffer-live-p inner))
+            (should (eq inner (fumos-connection-error-buffer connection)))
+            (let ((text
+                   (with-current-buffer inner
+                     (buffer-substring-no-properties
+                      (point-min) (point-max)))))
+              (should (string-search "watcher newer failure" text))
+              (should-not (string-search "watcher older failure" text))))
+        (when watcher
+          (remove-variable-watcher 'fumos-compilation--owner watcher))
+        (dolist (buffer (list baseline inner outer))
+          (when (buffer-live-p buffer)
+            (kill-buffer buffer)))))))
+
+(ert-deftest fumos-error-staging-rejects-corrupted-local-owner ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (let* ((context (fumos-eval--connection-context connection))
+           (fennel-proto-repl-error-buffer-action nil)
+           (baseline
+            (fumos-error-handler
+             "runtime" "preserved baseline failure" nil context))
+           watcher watcher-ran staging outer)
+      (unwind-protect
+          (progn
+            (setq
+             watcher
+             (lambda (_symbol new-value operation where)
+               (when (and (eq operation 'set)
+                          (hash-table-p new-value)
+                          (bufferp where)
+                          (eq connection
+                              (buffer-local-value
+                               'fumos-compilation--owner where))
+                          (not watcher-ran))
+                 (setq watcher-ran t staging where)
+                 (remove-variable-watcher
+                  'fumos-compilation--tokens watcher)
+                 (with-current-buffer where
+                   (setq fumos-compilation--owner nil)))))
+            (add-variable-watcher 'fumos-compilation--tokens watcher)
+            (setq outer
+                  (fumos-error-handler
+                   "runtime" "corrupted replacement failure" nil context))
+            (should watcher-ran)
+            (should-not outer)
+            (should-not (buffer-live-p staging))
+            (should (buffer-live-p baseline))
+            (should (eq baseline
+                        (fumos-connection-error-buffer connection)))
+            (should
+             (string-search
+              "preserved baseline failure"
+              (with-current-buffer baseline
+                (buffer-substring-no-properties (point-min) (point-max))))))
+        (when watcher
+          (remove-variable-watcher 'fumos-compilation--tokens watcher))
+        (dolist (buffer (list baseline staging outer))
+          (when (buffer-live-p buffer) (kill-buffer buffer)))))))
+
+(ert-deftest fumos-error-mode-hook-killed-source-preserves-history ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (erase-buffer)
+    (insert "(+ 1 missing)\n")
+    (let* ((source-buffer (current-buffer))
+           (marker (point-marker))
+           (source (fumos-eval--source (point)))
+           (request-context
+            (fumos-eval--request-context source marker 'utf8-byte))
+           (baseline-context (fumos-eval--connection-context connection))
+           (fennel-proto-repl-error-buffer-action nil)
+           (baseline
+            (fumos-error-handler
+             "runtime" "live source baseline" nil baseline-context))
+           hook-ran outer)
+      (unwind-protect
+          (progn
+            (let ((fumos-compilation-mode-hook
+                   (list
+                    (lambda ()
+                      (setq hook-ran t)
+                      (when (buffer-live-p source-buffer)
+                        (with-current-buffer source-buffer
+                          (set-buffer-modified-p nil))
+                        (kill-buffer source-buffer))))))
+              (setq outer
+                    (fumos-error-handler
+                     "runtime" "dead source replacement" nil request-context)))
+            (should hook-ran)
+            (should-not (buffer-live-p source-buffer))
+            (should-not (marker-buffer marker))
+            (should-not outer)
+            (should (buffer-live-p baseline))
+            (should (eq baseline
+                        (fumos-connection-error-buffer connection)))
+            (should
+             (string-search
+              "live source baseline"
+              (with-current-buffer baseline
+                (buffer-substring-no-properties (point-min) (point-max))))))
+        (when (buffer-live-p baseline) (kill-buffer baseline))))))
+
+(ert-deftest fumos-error-publish-rename-hook-cannot-overwrite-newer-error ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (let* ((context (fumos-eval--connection-context connection))
+           (name (fumos-eval--error-buffer-name connection))
+           (fennel-proto-repl-error-buffer-action nil)
+           (baseline
+            (fumos-error-handler
+             "runtime" "baseline failure" nil context))
+           hook-ran inner outer)
+      (unwind-protect
+          (progn
+            (let ((buffer-list-update-hook
+                   (list
+                    (lambda ()
+                      (let ((published
+                             (fumos-connection-error-buffer connection)))
+                        (when (and (not hook-ran)
+                                   (buffer-live-p published)
+                                   (not (eq baseline published))
+                                   (string-prefix-p
+                                    " *FUMOS Error staging*"
+                                    (buffer-name published)))
+                          (setq hook-ran t
+                                inner
+                                (fumos-error-handler
+                                 "runtime" "rename newer failure" nil
+                                 context))))))))
+              (setq outer
+                    (fumos-error-handler
+                     "runtime" "rename older failure" nil context)))
+            (should hook-ran)
+            (should-not outer)
+            (should-not (buffer-live-p baseline))
+            (should (buffer-live-p inner))
+            (should (eq inner (fumos-connection-error-buffer connection)))
+            (let ((text
+                   (with-current-buffer inner
+                     (buffer-substring-no-properties
+                      (point-min) (point-max)))))
+              (should (string-search "rename newer failure" text))
+              (should-not (string-search "rename older failure" text))))
+        (dolist (buffer (buffer-list))
+          (when (and (buffer-live-p buffer)
+                     (or (eq buffer baseline)
+                         (eq buffer inner)
+                         (eq buffer outer)
+                         (string-prefix-p
+                          " *FUMOS Error staging*" (buffer-name buffer))
+                         (string-prefix-p name (buffer-name buffer))))
+            (kill-buffer buffer)))))))
+
+(ert-deftest fumos-error-publish-corruption-rolls-back-to-history ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (let* ((context (fumos-eval--connection-context connection))
+           (name (fumos-eval--error-buffer-name connection))
+           (fennel-proto-repl-error-buffer-action nil)
+           (baseline
+            (fumos-error-handler
+             "runtime" "publish baseline failure" nil context))
+           hook-ran staging outer)
+      (unwind-protect
+          (progn
+            (let ((buffer-list-update-hook
+                   (list
+                    (lambda ()
+                      (let ((published
+                             (fumos-connection-error-buffer connection)))
+                        (when (and (not hook-ran)
+                                   (buffer-live-p published)
+                                   (not (eq baseline published))
+                                   (string-prefix-p
+                                    " *FUMOS Error staging*"
+                                    (buffer-name published)))
+                          (setq hook-ran t staging published)
+                          (with-current-buffer published
+                            (setq fumos-compilation--owner nil))))))))
+              (setq outer
+                    (fumos-error-handler
+                     "runtime" "corrupted published failure" nil context)))
+            (should hook-ran)
+            (should-not outer)
+            (should-not (buffer-live-p staging))
+            (should (buffer-live-p baseline))
+            (should (eq baseline
+                        (fumos-connection-error-buffer connection)))
+            (should
+             (string-search
+              "publish baseline failure"
+              (with-current-buffer baseline
+                (buffer-substring-no-properties (point-min) (point-max))))))
+        (dolist (buffer (buffer-list))
+          (when (and (buffer-live-p buffer)
+                     (or (eq buffer baseline)
+                         (eq buffer staging)
+                         (eq buffer outer)
+                         (string-prefix-p
+                          " *FUMOS Error staging*" (buffer-name buffer))
+                         (string-prefix-p name (buffer-name buffer))))
+            (kill-buffer buffer)))))))
+
+(ert-deftest fumos-error-publish-hook-restored-history-stays-live ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (let* ((context (fumos-eval--connection-context connection))
+           (fennel-proto-repl-error-buffer-action nil)
+           (baseline
+            (fumos-error-handler
+             "runtime" "explicit rollback baseline" nil context))
+           hook-ran staging outer)
+      (unwind-protect
+          (progn
+            (let ((buffer-list-update-hook
+                   (list
+                    (lambda ()
+                      (let ((published
+                             (fumos-connection-error-buffer connection)))
+                        (when (and (not hook-ran)
+                                   (buffer-live-p published)
+                                   (not (eq baseline published)))
+                          (setq hook-ran t staging published)
+                          (setf (fumos-connection-error-buffer connection)
+                                baseline)))))))
+              (setq outer
+                    (fumos-error-handler
+                     "runtime" "superseded publish" nil context)))
+            (should hook-ran)
+            (should-not outer)
+            (should-not (buffer-live-p staging))
+            (should (buffer-live-p baseline))
+            (should (eq baseline
+                        (fumos-connection-error-buffer connection))))
+        (dolist (buffer (list baseline staging outer))
+          (when (buffer-live-p buffer) (kill-buffer buffer)))))))
+
+(ert-deftest fumos-help-error-mode-hook-newer-query-wins ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (let ((source (current-buffer))
+          (name (fumos-eval--error-buffer-name connection))
+          (fennel-proto-repl-error-buffer-action 'show)
+          hook-ran displayed printed requests)
+      (unwind-protect
+          (progn
+            (setf
+             (fumos-test-server-handler server)
+             (lambda (state client line)
+               (when (fumos-test-command-request-p line)
+                 (let* ((request (fumos-test-read-command-request line))
+                        (symbol (plist-get request :doc)))
+                   (push symbol requests)
+                   (if (equal symbol "old-query")
+                       (fumos-test-send-command-error state client line)
+                     (fumos-test-send-tool-values
+                      state client line "doc" '("new-doc")))))))
+            (cl-letf (((symbol-function 'display-buffer)
+                       (lambda (&rest _) (setq displayed t)))
+                      ((symbol-function 'fennel-proto-repl--print)
+                       (lambda (value) (push value printed))))
+              (let ((fumos-compilation-mode-hook
+                     (list
+                      (lambda ()
+                        (unless hook-ran
+                          (setq hook-ran t)
+                          (with-current-buffer source
+                            (should
+                             (integerp
+                              (fumos-show-documentation "new-query")))))))))
+                (should
+                 (integerp (fumos-show-documentation "old-query")))
+                (fumos-test-assert-eval-settled connection)))
+            (should hook-ran)
+            (should-not displayed)
+            (should (equal '("old-query" "new-query")
+                           (nreverse requests)))
+            (should (equal '("new-doc\n") (nreverse printed)))
+            (should-not (fumos-connection-help-pending connection))
+            (should-not (fumos-connection-error-buffer connection))
+            (should-not (get-buffer name)))
+        (when-let* ((buffer (get-buffer name)))
+          (kill-buffer buffer))))))
+
 (ert-deftest fumos-error-real-frame-cleans-before-safe-navigation ()
   (fumos-test-with-fennel-file (root file connection server)
     (erase-buffer)
@@ -2154,6 +2821,81 @@
             (should-error (fumos-previous-error) :type 'user-error))
         (kill-buffer unrelated)))))
 
+(ert-deftest fumos-tool-query-supersede-and-invalidation-release-resources ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (let ((source-buffer (current-buffer)) received)
+      (setf
+       (fumos-test-server-handler server)
+       (lambda (state client line)
+         (when (fumos-test-command-request-p line)
+           (push line received)
+           (fumos-test-server-send
+            state
+            (format "(:id %d :op \"accept\")\n"
+                    (fumos-test-wire-message-id line))
+            client))))
+      (dolist (kind '(help xref eldoc))
+        (let* ((old-marker (point-marker))
+               (old-id
+                (fumos-eval--start-query
+                 kind :doc (format "%s-old" kind) #'ignore
+                 :marker old-marker))
+               (old-query (fumos-eval--query-pending connection kind)))
+          (should
+           (fumos-test-wait-until
+            (lambda ()
+              (memq old-id
+                    (fumos-connection-active-request-ids connection)))))
+          (let* ((new-marker (point-marker))
+                 (new-id
+                  (fumos-eval--start-query
+                   kind :doc (format "%s-new" kind) #'ignore
+                   :marker new-marker))
+                 (new-query (fumos-eval--query-pending connection kind)))
+            (should-not (eq old-query new-query))
+            (should-not (marker-buffer old-marker))
+            (should-not (fumos-tool-query-request-id old-query))
+            (should-not (fumos-tool-query-callback-identity old-query))
+            (should-not (fumos-tool-query-repl-buffer old-query))
+            (should-not (fumos-tool-query-source-buffer old-query))
+            (should-not (fumos-tool-query-source-context old-query))
+            (should-not (fumos-tool-query-authority old-query))
+            (should-not
+             (memq old-id
+                   (fumos-connection-active-request-ids connection)))
+            (should-not
+             (gethash old-id
+                      (fumos-repl--callback-delivery-table connection)))
+            (with-current-buffer (fumos-connection-repl-buffer connection)
+              (should-not
+               (gethash old-id fennel-proto-repl--message-callbacks)))
+            (should
+             (fumos-test-wait-until
+              (lambda ()
+                (memq new-id
+                      (fumos-connection-active-request-ids connection)))))
+            (fumos-eval--invalidate-source-tooling
+             connection source-buffer)
+            (should-not (fumos-eval--query-pending connection kind))
+            (should-not (marker-buffer new-marker))
+            (should-not (fumos-tool-query-request-id new-query))
+            (should-not (fumos-tool-query-callback-identity new-query))
+            (should-not (fumos-tool-query-repl-buffer new-query))
+            (should-not (fumos-tool-query-source-buffer new-query))
+            (should-not (fumos-tool-query-source-context new-query))
+            (should-not (fumos-tool-query-authority new-query))
+            (should-not
+             (memq new-id
+                   (fumos-connection-active-request-ids connection)))
+            (should-not
+             (gethash new-id
+                      (fumos-repl--callback-delivery-table connection)))
+            (with-current-buffer (fumos-connection-repl-buffer connection)
+              (should-not
+               (gethash new-id fennel-proto-repl--message-callbacks))))))
+      (should (= 6 (length received)))
+      (fumos-test-assert-eval-settled connection))))
+
 (ert-deftest fumos-help-uses-five-real-proto-shapes-and-ui ()
   (fumos-test-with-fennel-file (root file connection server)
     (erase-buffer)
@@ -2235,6 +2977,479 @@
       (should (assq 'auto-jump display-alist))
       (set-marker pushed-marker nil))))
 
+(ert-deftest fumos-help-output-stops-after-newer-query-reentry ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (let ((source (current-buffer)) printed reentered requests)
+      (setf
+       (fumos-test-server-handler server)
+       (lambda (state client line)
+         (when (fumos-test-command-request-p line)
+           (let ((request (fumos-test-read-command-request line)))
+             (push request requests)
+             (cond
+              ((plist-member request :apropos)
+               (fumos-test-send-tool-values
+                state client line "apropos" '("old-a" "old-b")))
+              ((plist-member request :doc)
+               (fumos-test-send-tool-values
+                state client line "doc" '("new-doc"))))))))
+      (cl-letf
+          (((symbol-function 'fennel-proto-repl--print)
+            (lambda (value)
+              (push value printed)
+              (unless reentered
+                (setq reentered t)
+                (with-current-buffer source
+                  (should
+                   (integerp (fumos-show-documentation "new-query"))))))))
+        (should (integerp (fumos-apropos "old-query")))
+        (fumos-test-assert-eval-settled connection))
+      (should reentered)
+      (should (equal '("old-a\n" "new-doc\n") (nreverse printed)))
+      (should (= 2 (length requests)))
+      (should-not (fumos-connection-help-pending connection)))))
+
+(ert-deftest fumos-help-errors-use-owned-fumos-error-buffer ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (erase-buffer)
+    (insert "(demo 1)\n")
+    (goto-char (point-min))
+    (when-let* ((upstream (get-buffer "*Fennel Error*")))
+      (kill-buffer upstream))
+    (let ((fennel-proto-repl-error-buffer-action nil)
+          requests error-buffers)
+      (setf
+       (fumos-test-server-handler server)
+       (lambda (state client line)
+         (cond
+          ((fumos-test-eval-request-p line)
+           (push :eval requests)
+           (fumos-test-send-command-error state client line))
+          ((fumos-test-command-request-p line)
+           (let ((request (fumos-test-read-command-request line)))
+             (push
+              (seq-find (lambda (op) (plist-member request op))
+                        '(:doc :apropos :find))
+              requests)
+             (fumos-test-send-command-error state client line))))))
+      (dolist (command
+               (list
+                #'fumos-macroexpand
+                (lambda () (fumos-show-documentation "demo.doc"))
+                (lambda () (fumos-show-arglist "demo.fn"))
+                (lambda () (fumos-apropos "demo"))
+                (lambda () (fumos-find-definition "demo.fn"))))
+        (should (integerp (funcall command)))
+        (fumos-test-assert-eval-settled connection)
+        (let ((buffer (fumos-connection-error-buffer connection)))
+          (should (buffer-live-p buffer))
+          (should (eq connection
+                      (buffer-local-value 'fumos-compilation--owner buffer)))
+          (should (eql (fumos-connection-generation connection)
+                       (buffer-local-value
+                        'fumos-compilation--generation buffer)))
+          (push buffer error-buffers))
+        (should-not (fumos-connection-help-pending connection))
+        (should-not (fumos-connection-xref-pending connection))
+        (should-not (get-buffer "*Fennel Error*")))
+      (should (equal '(:eval :doc :eval :apropos :find)
+                     (nreverse requests)))
+      (should (= 5 (length (delete-dups error-buffers))))
+      (should (buffer-live-p (car error-buffers)))
+      (dolist (buffer (cdr error-buffers))
+        (should-not (buffer-live-p buffer)))
+      (let ((buffer (car error-buffers)))
+        (should (string-match-p
+                 "command failed"
+                 (with-current-buffer buffer
+                   (buffer-substring-no-properties
+                    (point-min) (point-max)))))))))
+
+(ert-deftest fumos-find-definition-is-async-and-never-enters-sync-loop ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (erase-buffer)
+    (insert "first second\n")
+    (goto-char (point-min))
+    (let (pending shown first-id second-id)
+      (setf
+       (fumos-test-server-handler server)
+       (lambda (state client line)
+         (when (and (fumos-test-command-request-p line)
+                    (plist-member (fumos-test-read-command-request line) :find))
+           ;; Deliberately do not reply while either public command is active.
+           (setq pending (append pending (list (list state client line)))))))
+      (cl-letf (((symbol-function 'fennel-proto-repl-send-message-sync)
+                 (lambda (&rest _) (ert-fail "find used sync transport")))
+                ((symbol-function 'accept-process-output)
+                 (lambda (&rest _) (ert-fail "find entered a sync loop"))))
+        (setq first-id (fumos-find-definition "first")
+              second-id (fumos-find-definition-other-window "second")))
+      (should (integerp first-id))
+      (should (integerp second-id))
+      (should (/= first-id second-id))
+      (should (fumos-test-wait-until (lambda () (= 2 (length pending)))))
+      (let ((xref-show-definitions-function
+             (lambda (fetcher _alist) (push (funcall fetcher) shown))))
+        (cl-letf (((symbol-function 'xref-push-marker-stack) #'ignore))
+          (dolist (entry pending)
+            (apply #'fumos-test-send-tool-values
+                   (append entry
+                           '("find"
+                             ("mods/demo/scripts/foo.fnl:1:1")))))
+          (fumos-test-assert-eval-settled connection)))
+      (should (= 1 (length shown)))
+      (should-not (fumos-connection-xref-pending connection))
+      (let ((original-format
+             (symbol-function 'fennel-proto-repl--format-message))
+            (original-send
+             (symbol-function 'fennel-proto-repl--send-string))
+            (original-point-marker (symbol-function 'point-marker)))
+        (dolist (case '((formatter error) (send error)
+                        (formatter quit) (send quit)
+                        (formatter keyboard-quit) (send keyboard-quit)))
+          (pcase-let ((`(,point ,kind) case))
+            (let (captured-marker outcome)
+              (cl-labels
+                  ((injected-exit
+                    ()
+                    (pcase kind
+                      ('quit (signal 'quit '("find injection")))
+                      ('keyboard-quit (keyboard-quit))
+                      (_ (error "find injection")))))
+                (cl-letf
+                    (((symbol-function 'point-marker)
+                      (lambda ()
+                        (setq captured-marker
+                              (funcall original-point-marker))))
+                     ((symbol-function 'fennel-proto-repl--format-message)
+                      (if (eq point 'formatter)
+                          (lambda (&rest _) (injected-exit))
+                        original-format))
+                     ((symbol-function 'fennel-proto-repl--send-string)
+                      (if (eq point 'send)
+                          (lambda (&rest _) (injected-exit))
+                        original-send)))
+                  (setq outcome
+                        (condition-case caught
+                            (progn
+                              (fumos-find-definition "failure")
+                              :returned)
+                          (error (cons 'error caught))
+                          (quit (cons 'quit caught))))))
+              (should (eq (if (eq kind 'keyboard-quit) 'quit kind)
+                          (car outcome)))
+              (should (markerp captured-marker))
+              (should-not (marker-buffer captured-marker))
+              (should-not (fumos-connection-xref-pending connection))
+              (fumos-test-assert-eval-settled connection))))))))
+
+(ert-deftest fumos-find-definition-preserves-public-xref-ux ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (erase-buffer)
+    (insert "origin\n(def target [] nil)\n")
+    (goto-char (point-min))
+    (switch-to-buffer (current-buffer))
+    (delete-other-windows)
+    (xref-clear-marker-stack)
+    (when-let* ((old-xref (get-buffer xref-buffer-name)))
+      (kill-buffer old-xref))
+    (let* ((source (current-buffer))
+           (origin-window (selected-window))
+           (origin-point (point))
+           (default-handler #'xref-show-definitions-buffer)
+           (default-directory-handler
+            (symbol-function 'xref--ensure-default-directory))
+           messages xref-buffer xref-directory-timer)
+      (setf
+       (fumos-test-server-handler server)
+       (lambda (state client line)
+         (when (and (fumos-test-command-request-p line)
+                    (plist-member
+                     (fumos-test-read-command-request line) :find))
+           (let ((symbol
+                  (plist-get (fumos-test-read-command-request line) :find)))
+             (fumos-test-send-tool-values
+              state client line "find"
+              (if (equal symbol "target")
+                  '("mods/demo/scripts/foo.fnl:2:2")
+                nil))))))
+      ;; The real Emacs 30 definition UI jumps directly for one xref.  FUMOS
+      ;; must push the captured source marker before handing it to that UI.
+      (let ((xref-show-definitions-function default-handler))
+        (should (integerp (fumos-find-definition "target")))
+        (fumos-test-assert-eval-settled connection))
+      (should (eq source (window-buffer origin-window)))
+      (should (= 2 (line-number-at-pos (window-point origin-window))))
+      (should (= 1 (save-excursion
+                     (goto-char (window-point origin-window))
+                     (- (point) (line-beginning-position)))))
+      (should-not (xref-marker-stack-empty-p))
+      (xref-go-back)
+      (should (eq source (window-buffer origin-window)))
+      (should (= origin-point (window-point origin-window)))
+      (xref-clear-marker-stack)
+      ;; A real empty find response reports not-found without manufacturing a
+      ;; history entry or invoking the definition display function.
+      (let ((xref-show-definitions-function
+             (lambda (&rest _)
+               (ert-fail "Empty find entered the xref UI"))))
+        (cl-letf (((symbol-function 'message)
+                   (lambda (format-string &rest arguments)
+                     (push (apply #'format format-string arguments) messages))))
+          (should (integerp (fumos-find-definition "missing")))
+          (fumos-test-assert-eval-settled connection)))
+      (should (xref-marker-stack-empty-p))
+      (should (member "No definition found for missing" messages))
+      ;; Pinned Fennel find returns at most one locus, so inject two already
+      ;; validated xrefs at the display boundary to exercise standard *xref*.
+      (let* ((one
+              (xref-make
+               "first definition"
+               (xref-make-buffer-location source (point-min))))
+             (two
+              (xref-make
+               "second definition"
+               (xref-make-buffer-location source (point-max))))
+             (xrefs (list one two))
+             (origin-marker (with-current-buffer source (point-marker)))
+             (query
+              (fumos-tool-query--create
+               :marker origin-marker :window origin-window
+               :display-action 'window))
+             seen-fetcher seen-alist seen-window)
+        (cl-letf
+            (((symbol-function 'fumos-eval--query-current-p)
+              (lambda (_query) t))
+             ((symbol-function 'xref--ensure-default-directory)
+              (lambda (directory buffer)
+                (setq xref-directory-timer
+                      (funcall default-directory-handler directory buffer)))))
+          (let ((xref-auto-jump-to-first-definition nil)
+                (xref-show-definitions-function
+                 (lambda (fetcher alist)
+                   (setq seen-fetcher fetcher
+                         seen-alist alist
+                         seen-window (selected-window))
+                   (funcall default-handler fetcher alist))))
+            (fumos-eval--display-definition-xrefs query xrefs)))
+        (should-not (marker-buffer origin-marker))
+        (should (eq origin-window seen-window))
+        (should (eq origin-window (alist-get 'window seen-alist)))
+        (should (eq 'window (alist-get 'display-action seen-alist)))
+        (should (functionp seen-fetcher))
+        (with-temp-buffer
+          (should (equal xrefs (funcall seen-fetcher))))
+        (setq xref-buffer (get-buffer xref-buffer-name))
+        (should (buffer-live-p xref-buffer))
+        ;; Emacs 30 defers xref's default-directory commit to a zero timer.
+        ;; Drain that exact timer before the fixture removes its target buffer.
+        (should (timerp xref-directory-timer))
+        (should
+         (fumos-test-wait-until
+          (lambda () (not (memq xref-directory-timer timer-list)))))
+        (with-current-buffer xref-buffer
+          (should (eq major-mode 'xref--xref-buffer-mode))
+          (should (functionp xref--fetcher))
+          (should (equal xrefs (funcall xref--fetcher)))
+          (revert-buffer nil t)
+          (let ((contents
+                 (buffer-substring-no-properties (point-min) (point-max))))
+            (should (string-search "first definition" contents))
+            (should (string-search "second definition" contents))))
+        (xref-clear-marker-stack))
+      ;; A UI handler may leave nonlocally.  The origin marker is released by
+      ;; the display unwind and a later owner cleanup must remain a no-op.
+      (let* ((marker (with-current-buffer source (point-marker)))
+             (query
+              (fumos-tool-query--create
+               :marker marker :window origin-window :display-action nil))
+             (xref
+              (xref-make
+               "nonlocal definition"
+               (xref-make-buffer-location source (point-min))))
+             (original-set-marker (symbol-function 'set-marker))
+             (release-count 0)
+             outcome)
+        (cl-letf
+            (((symbol-function 'fumos-eval--query-current-p)
+              (lambda (_query) t))
+             ((symbol-function 'xref-push-marker-stack) #'ignore)
+             ((symbol-function 'set-marker)
+              (lambda (target position &optional buffer)
+                (when (and (eq target marker) (null position))
+                  (cl-incf release-count))
+                (funcall original-set-marker target position buffer))))
+          (let ((xref-show-definitions-function
+                 (lambda (&rest _)
+                   (signal 'quit '("injected xref UI exit")))))
+            (setq outcome
+                  (condition-case nil
+                      (progn
+                        (fumos-eval--display-definition-xrefs
+                         query (list xref))
+                        'returned)
+                    (quit 'quit))))
+          (fumos-eval--release-query-marker query))
+        (should (eq 'quit outcome))
+        (should-not (marker-buffer marker))
+        (should (= 1 release-count)))
+      (when (buffer-live-p xref-buffer)
+        (kill-buffer xref-buffer)))))
+
+(ert-deftest fumos-find-file-hook-reentry-cannot-cache-or-display-stale-xref ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (let* ((target (expand-file-name "scripts/target.fnl" root))
+           (target-buffer (get-file-buffer target))
+           query marker shown hook-ran)
+      (unwind-protect
+          (progn
+            (when (buffer-live-p target-buffer) (kill-buffer target-buffer))
+            (with-temp-file target (insert "(fn target [] :ok)\n"))
+            (setf
+             (fumos-test-server-handler server)
+             (lambda (state client line)
+               (when (and (fumos-test-command-request-p line)
+                          (plist-member
+                           (fumos-test-read-command-request line) :find))
+                 (fumos-test-send-tool-values
+                  state client line "find"
+                  '("mods/demo/scripts/target.fnl:1:1")))))
+            (let ((find-file-hook
+                   (list
+                    (lambda ()
+                      (setq hook-ran t)
+                      (fumos-repl--mark-disconnected
+                       connection "find-file hook teardown"))))
+                  (xref-show-definitions-function
+                   (lambda (&rest _) (setq shown t))))
+              (should (integerp (fumos-find-definition "target")))
+              (setq query (fumos-connection-xref-pending connection)
+                    marker (fumos-tool-query-marker query))
+              (should (marker-buffer marker))
+              (should (fumos-test-wait-until (lambda () hook-ran))))
+            (fumos-test-assert-eval-settled connection)
+            (should (eq 'disconnected (fumos-connection-state connection)))
+            (should-not shown)
+            (should-not (marker-buffer marker))
+            (should-not (fumos-connection-xref-pending connection))
+            (should
+             (hash-table-empty-p (fumos-connection-xref-cache connection))))
+        (setq target-buffer (get-file-buffer target))
+        (when (buffer-live-p target-buffer)
+          (with-current-buffer target-buffer (set-buffer-modified-p nil))
+          (kill-buffer target-buffer))))))
+
+(ert-deftest fumos-find-validates-real-single-locus ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (let* ((relative-file (expand-file-name "scripts/relative.fnl" root))
+           (macro-file (expand-file-name "fnl/macros.fnlm" root))
+           (bytes-file (expand-file-name "scripts/bytes.fnl" root))
+           (escape-file (expand-file-name "scripts/escape.fnl" root))
+           (outside (make-temp-file "fumos-find-outside-" nil ".fnl"))
+           (hostile
+            `(("other-mod" . "mods/other/scripts/foo.fnl:1:1")
+              ("absolute" . ,(format "%s:1:1" outside))
+              ("tramp" . "/ssh:host:/tmp/outside.fnl:1:1")
+              ("parent" . "../outside.fnl:1:1")
+              ("normalized-parent" . "scripts/../foo.fnl:1:1")
+              ("symlink" . "scripts/escape.fnl:1:1")
+              ("zero-line" . "scripts/relative.fnl:0:1")
+              ("negative-line" . "scripts/relative.fnl:-1:1")
+              ("noninteger-line" . "scripts/relative.fnl:x:1")
+              ("zero-column" . "scripts/relative.fnl:1:0")
+              ("huge-line" . "scripts/relative.fnl:999999999:1")
+              ("huge-column" . "scripts/relative.fnl:1:999999999")
+              ("mid-codepoint" . "scripts/bytes.fnl:1:3")
+              ("not-fennel" . "scripts/source.lua:1:1")))
+           (responses
+            (append
+             '(("relative" . "scripts/relative.fnl:1:1")
+               ("macro" . "@mods/demo/fnl/macros.fnlm:1:2"))
+             hostile))
+           (original-truename (symbol-function 'file-truename))
+           (fennel-proto-repl-error-buffer-action nil)
+           requests shown opened)
+      (unwind-protect
+          (progn
+            (dolist (entry `((,relative-file . "(print :relative)\n")
+                             (,macro-file . "(fn macro [] nil)\n")
+                             (,bytes-file . "\t中文😀x\n")))
+              (make-directory (file-name-directory (car entry)) t)
+              (with-temp-file (car entry) (insert (cdr entry))))
+            (make-symbolic-link outside escape-file)
+            (when-let* ((upstream (get-buffer "*Fennel Error*")))
+              (kill-buffer upstream))
+            (setf
+             (fumos-test-server-handler server)
+             (lambda (state client line)
+               (when (and (fumos-test-command-request-p line)
+                          (plist-member
+                           (fumos-test-read-command-request line) :find))
+                 (let* ((request (fumos-test-read-command-request line))
+                        (symbol (plist-get request :find))
+                        (locus (cdr (assoc-string symbol responses t))))
+                   (push symbol requests)
+                   (if (equal symbol "unknown")
+                       (fumos-test-send-command-error state client line)
+                     (should (stringp locus))
+                     ;; Pinned Fennel find returns at most one locus value.
+                     (fumos-test-send-tool-values
+                      state client line "find" (list locus)))))))
+            (let ((xref-show-definitions-function
+                   (lambda (fetcher _alist)
+                     (push (funcall fetcher) shown))))
+              (cl-letf
+                  (((symbol-function 'xref-push-marker-stack) #'ignore)
+                   ((symbol-function 'file-truename)
+                    (lambda (path &rest arguments)
+                      (when (file-remote-p path)
+                        (ert-fail
+                         (format "Remote locus reached file-truename: %S" path)))
+                      (apply original-truename path arguments))))
+                (cl-labels
+                    ((run-find
+                      (symbol should-show)
+                      (let ((before (length shown)))
+                        (should (integerp (fumos-find-definition symbol)))
+                        (fumos-test-assert-eval-settled connection)
+                        (should (= (+ before (if should-show 1 0))
+                                   (length shown)))
+                        (should-not
+                         (fumos-connection-xref-pending connection)))))
+                  (run-find "relative" t)
+                  (run-find "macro" t)
+                  (dolist (entry hostile)
+                    (run-find (car entry) nil)
+                    (let ((buffer (fumos-connection-error-buffer connection)))
+                      (should (buffer-live-p buffer))
+                      (should
+                       (eq connection
+                           (buffer-local-value
+                            'fumos-compilation--owner buffer)))))
+                  (run-find "unknown" nil))))
+            (should (= 2 (length shown)))
+            (let ((expected (list (file-truename macro-file)
+                                  (file-truename relative-file))))
+              (dolist (xrefs shown)
+                (should (= 1 (length xrefs)))
+                (let* ((location (xref-item-location (car xrefs)))
+                       (marker (xref-location-marker location))
+                       (buffer (marker-buffer marker)))
+                  (should (buffer-live-p buffer))
+                  (push buffer opened)
+                  (should (member (file-truename (buffer-file-name buffer))
+                                  expected))
+                  (set-marker marker nil))))
+            (should (= (+ 3 (length hostile)) (length requests)))
+            (should-not (get-file-buffer outside))
+            (should-not (get-buffer "*Fennel Error*")))
+        (when (file-symlink-p escape-file) (delete-file escape-file))
+        (when (file-exists-p outside) (delete-file outside))
+        (dolist (buffer opened)
+          (when (and (buffer-live-p buffer)
+                     (not (eq buffer (current-buffer))))
+            (kill-buffer buffer)))))))
+
 (ert-deftest fumos-find-latest-query-owns-the-result ()
   (fumos-test-with-fennel-file (root file connection server)
     (erase-buffer)
@@ -2289,13 +3504,55 @@
         (should (buffer-live-p (fumos-connection-error-buffer connection)))
         (should-not (get-buffer "*Fennel Error*"))))))
 
+(ert-deftest fumos-find-marker-stack-reentry-does-not-show-old-result ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (erase-buffer)
+    (insert "old new\n")
+    (goto-char (point-min))
+    (let ((source-buffer (current-buffer)) pushed reentered shown new-line
+          new-id reentry-error)
+      (setf
+       (fumos-test-server-handler server)
+       (lambda (state client line)
+         (when (and (fumos-test-command-request-p line)
+                    (plist-member
+                     (fumos-test-read-command-request line) :find))
+           (if (equal "old"
+                      (plist-get (fumos-test-read-command-request line) :find))
+               (fumos-test-send-tool-values
+                state client line "find"
+                '("mods/demo/scripts/foo.fnl:1:1"))
+             (setq new-line line)))))
+      (let ((xref-show-definitions-function
+             (lambda (&rest _arguments) (setq shown t))))
+        (cl-letf
+            (((symbol-function 'xref-push-marker-stack)
+              (lambda (&optional marker)
+                (setq pushed marker reentered t)
+                (condition-case caught
+                    (with-current-buffer source-buffer
+                      (setq new-id (fumos-find-definition "new")))
+                  ((error quit) (setq reentry-error caught)))
+                (when (markerp marker) (set-marker marker nil)))))
+          (should (integerp (fumos-find-definition "old")))
+          (should (fumos-test-wait-until (lambda () reentered)))))
+      (should (markerp pushed))
+      (should-not reentry-error)
+      (should (integerp new-id))
+      (should-not shown)
+      (should (fumos-test-wait-until (lambda () new-line)))
+      (fumos-eval--invalidate-source-tooling connection source-buffer)
+      (fumos-test-assert-eval-settled connection))))
+
 (ert-deftest fumos-async-eldoc-and-completion-cache-are-generation-owned ()
   (fumos-test-with-fennel-file (root file connection server)
     (erase-buffer)
     (insert "demo")
     (goto-char (point-max))
-    (let ((fennel-proto-repl-annotate-completion nil)
-          completion-lines eldoc-lines eldoc-result held)
+    (let ((fennel-proto-repl-annotate-completion t)
+          completion-lines kind-lines eldoc-lines eldoc-result held-eldoc
+          initial-completion initial-kind failed-completion failed-kind
+          short-completion long-completion baseline-candidates baseline-kinds)
       (setf
        (fumos-test-server-handler server)
        (lambda (state client line)
@@ -2303,34 +3560,146 @@
           ((and (fumos-test-command-request-p line)
                 (plist-member (fumos-test-read-command-request line)
                               :complete))
-           (push line completion-lines)
-           (fumos-test-send-tool-values
-            state client line "complete" '("demo-one" "demo-two")))
+           (push (list state client line) completion-lines))
           ((fumos-test-eval-request-p line)
-           (push line eldoc-lines)
-           (if held
-               (setq held (list state client line))
-             (fumos-test-send-tool-values
-              state client line "eval" '("\"runtime docs\"")))))))
+           (let ((wire
+                  (plist-get (fumos-test-read-eval-request line) :eval)))
+             (if (string-search "symbol-type" wire)
+                 (push (list state client line) kind-lines)
+               (push line eldoc-lines)
+               (if held-eldoc
+                   (setq held-eldoc (list state client line))
+                 (fumos-test-send-tool-values
+                  state client line "eval" '("\"runtime docs\"")))))))))
       (cl-letf (((symbol-function 'fennel-proto-repl-send-message-sync)
                  (lambda (&rest _) (ert-fail "tooling used sync transport")))
                 ((symbol-function 'accept-process-output)
                  (lambda (&rest _) (ert-fail "tooling blocked"))))
         (should-not (fumos-completion-at-point)))
+      (should (fumos-test-wait-until (lambda () (= 1 (length completion-lines)))))
+      (setq initial-completion (car completion-lines))
+      (apply
+       #'fumos-test-send-tool-values
+       (append
+        initial-completion
+        '("complete"
+          ("demo-fn" "demo-table" "demo-special" "demo-macro"
+           "demo-number" "demo-bool" "demo-string" "demo-unknown"
+           "demo.field"))))
+      ;; Annotation is a second request and no partial candidate list is
+      ;; committed while its kind vector is still outstanding.
+      (should (fumos-test-wait-until (lambda () (= 1 (length kind-lines)))))
+      (setq initial-kind (car kind-lines))
       (let ((key (cons (current-buffer) "demo")))
-        (should
-         (fumos-test-wait-until
-          (lambda ()
-            (fumos-completion-cache-p
-             (gethash key (fumos-connection-completion-cache connection))))))
-        (let ((capf (fumos-completion-at-point)))
-          (should (equal '("demo-one" "demo-two") (nth 2 capf))))
-        (setf
-         (fumos-completion-cache-generation
-          (gethash key (fumos-connection-completion-cache connection)))
-         (1- (fumos-connection-generation connection)))
-        (should-not (fumos-completion-at-point)))
+        (should-not
+         (gethash key (fumos-connection-completion-cache connection))))
+      (apply
+       #'fumos-test-send-tool-values
+       (append
+        initial-kind
+        '("eval"
+          ("[\"function\" \"table\" \"special\" \"macro\" \"number\" \"boolean\" \"string\" \"userdata\" \"userdata\"]"))))
       (fumos-test-assert-eval-settled connection)
+      (let* ((key (cons (current-buffer) "demo"))
+             (cache
+              (gethash key (fumos-connection-completion-cache connection)))
+             (capf (fumos-completion-at-point))
+             (properties (nthcdr 3 capf))
+             (kind (plist-get properties :company-kind))
+             (annotation (plist-get properties :annotation-function)))
+        (should (fumos-completion-cache-p cache))
+        (setq baseline-candidates
+              (copy-sequence (fumos-completion-cache-candidates cache))
+              baseline-kinds (copy-tree (fumos-completion-cache-kinds cache)))
+        (should (equal baseline-candidates (nth 2 capf)))
+        (dolist (case '(("demo-fn" function " function")
+                        ("demo-table" module " table")
+                        ("demo-special" keyword " keyword")
+                        ("demo-macro" macro " macro")
+                        ("demo-number" constant " constant")
+                        ("demo-bool" boolean " boolean")
+                        ("demo-string" string " string")
+                        ("demo-unknown" variable " definition")
+                        ("demo.field" field " field")))
+          (should (eq (nth 1 case) (funcall kind (car case))))
+          (should (equal (nth 2 case) (funcall annotation (car case))))))
+      ;; A failed :complete refresh leaves the last-good annotated cache
+      ;; available instead of turning an intermittent runtime failure into an
+      ;; empty completion UI.
+      (should (fumos-test-wait-until (lambda () (= 2 (length completion-lines)))))
+      (setq failed-completion (car completion-lines))
+      (apply #'fumos-test-send-command-error failed-completion)
+      (fumos-test-assert-eval-settled connection)
+      (let* ((key (cons (current-buffer) "demo"))
+             (cache
+              (gethash key (fumos-connection-completion-cache connection))))
+        (should (equal baseline-candidates
+                       (fumos-completion-cache-candidates cache)))
+        (should (equal baseline-kinds (fumos-completion-cache-kinds cache))))
+      ;; The same retention rule applies when :complete succeeds but the
+      ;; optional kind request fails.
+      (should (fumos-completion-at-point))
+      (should (fumos-test-wait-until (lambda () (= 3 (length completion-lines)))))
+      (setq failed-completion (car completion-lines))
+      (apply #'fumos-test-send-tool-values
+             (append failed-completion '("complete" ("demo-new"))))
+      (should (fumos-test-wait-until (lambda () (= 2 (length kind-lines)))))
+      (setq failed-kind (car kind-lines))
+      (apply #'fumos-test-send-command-error failed-kind)
+      (fumos-test-assert-eval-settled connection)
+      (let* ((key (cons (current-buffer) "demo"))
+             (cache
+              (gethash key (fumos-connection-completion-cache connection))))
+        (should (equal baseline-candidates
+                       (fumos-completion-cache-candidates cache)))
+        (should (equal baseline-kinds (fumos-completion-cache-kinds cache)))
+        ;; A cache object from an earlier transport generation is never
+        ;; returned, even if its source/prefix key happens to match.
+        (setf (fumos-completion-cache-generation cache)
+              (1- (fumos-connection-generation connection)))
+        (should-not (fumos-completion-at-point))
+        (setf (fumos-completion-cache-generation cache)
+              (fumos-connection-generation connection)))
+      (should (fumos-test-wait-until (lambda () (= 4 (length completion-lines)))))
+      (apply #'fumos-test-send-command-error (car completion-lines))
+      (fumos-test-assert-eval-settled connection)
+      ;; A new prefix supersedes the previous pending completion intent.  The
+      ;; old no-response request must not accumulate transport resources.
+      (erase-buffer)
+      (insert "be")
+      (goto-char (point-max))
+      (let ((fennel-proto-repl-annotate-completion nil))
+        (should-not (fumos-completion-at-point)))
+      (should (fumos-test-wait-until (lambda () (= 5 (length completion-lines)))))
+      (setq short-completion (car completion-lines))
+      (erase-buffer)
+      (insert "beta")
+      (goto-char (point-max))
+      (let ((fennel-proto-repl-annotate-completion nil))
+        (should-not (fumos-completion-at-point)))
+      (should (fumos-test-wait-until (lambda () (= 6 (length completion-lines)))))
+      (setq long-completion (car completion-lines))
+      (should (= 1 (hash-table-count
+                    (fumos-connection-completion-pending connection))))
+      (apply #'fumos-test-send-tool-values
+             (append long-completion '("complete" ("beta-one"))))
+      (apply #'fumos-test-send-tool-values
+             (append short-completion '("complete" ("be-one" "be-two"))))
+      (fumos-test-assert-eval-settled connection)
+      (should
+       (hash-table-empty-p (fumos-connection-completion-pending connection)))
+      (let ((short-cache
+             (gethash (cons (current-buffer) "be")
+                      (fumos-connection-completion-cache connection)))
+            (long-cache
+             (gethash (cons (current-buffer) "beta")
+                      (fumos-connection-completion-cache connection))))
+        (should-not short-cache)
+        (should (equal '("beta-one")
+                       (fumos-completion-cache-candidates long-cache))))
+      (erase-buffer)
+      (insert "docsym")
+      (goto-char (point-max))
       (setq-local fennel-proto-repl-fennel-module-name "decoy.module")
       (cl-letf (((symbol-function 'fennel-proto-repl--eldoc-fn-in-current-sexp)
                  (lambda () nil))
@@ -2347,52 +3716,486 @@
              (wire (plist-get request :eval)))
         (should (string-search "(require \"fumos.repl.fennel\")" wire))
         (should-not (string-search "decoy.module" wire)))
-      (setq held t eldoc-result nil)
+      (setq held-eldoc t eldoc-result nil)
       (cl-letf (((symbol-function 'fennel-proto-repl--eldoc-fn-in-current-sexp)
                  (lambda () nil)))
         (should
          (fumos-eldoc-function
           (lambda (&rest values) (setq eldoc-result values)))))
-      (should (fumos-test-wait-until (lambda () (consp held))))
+      (should (fumos-test-wait-until (lambda () (consp held-eldoc))))
       (insert "x")
       (apply #'fumos-test-send-tool-values
-             (append held '("eval" ("\"stale docs\""))))
+             (append held-eldoc '("eval" ("\"stale docs\""))))
       (fumos-test-assert-eval-settled connection)
       (should-not eldoc-result)
       (should-not (fumos-connection-eldoc-pending connection))
       (should (hash-table-empty-p
                (fumos-connection-completion-pending connection)))
-      (should (>= (length completion-lines) 2)))))
+      (should (= 6 (length completion-lines)))
+      (should (= 2 (length kind-lines))))))
+
+(ert-deftest fumos-completion-supersede-and-invalidation-release-resources ()
+  (fumos-test-with-fennel-file (root file connection server)
+    (let ((source-buffer (current-buffer)) lines)
+      (setf
+       (fumos-test-server-handler server)
+       (lambda (state client line)
+         (when (and (fumos-test-command-request-p line)
+                    (plist-member
+                     (fumos-test-read-command-request line) :complete))
+           (push line lines)
+           (fumos-test-server-send
+            state
+            (format "(:id %d :op \"accept\")\n"
+                    (fumos-test-wire-message-id line))
+            client))))
+      (erase-buffer)
+      (insert "be")
+      (goto-char (point-max))
+      (let ((fennel-proto-repl-annotate-completion nil))
+        (should-not (fumos-completion-at-point)))
+      (should (fumos-test-wait-until (lambda () (= 1 (length lines)))))
+      (let* ((old-key (cons source-buffer "be"))
+             (old-query
+              (gethash old-key
+                       (fumos-connection-completion-pending connection)))
+             (old-id (fumos-completion-query-request-id old-query)))
+        (should
+         (fumos-test-wait-until
+          (lambda ()
+            (memq old-id
+                  (fumos-connection-active-request-ids connection)))))
+        (erase-buffer)
+        (insert "beta")
+        (goto-char (point-max))
+        (let ((fennel-proto-repl-annotate-completion nil))
+          (should-not (fumos-completion-at-point)))
+        (should (fumos-test-wait-until (lambda () (= 2 (length lines)))))
+        (let* ((new-key (cons source-buffer "beta"))
+               (new-query
+                (gethash new-key
+                         (fumos-connection-completion-pending connection)))
+               (new-id (fumos-completion-query-request-id new-query)))
+          (should (fumos-completion-query-p new-query))
+          (should-not
+           (gethash old-key
+                    (fumos-connection-completion-pending connection)))
+          (should-not (fumos-completion-query-request-id old-query))
+          (should-not (fumos-completion-query-callback-identity old-query))
+          (should-not (fumos-completion-query-repl-buffer old-query))
+          (should-not (fumos-completion-query-source-buffer old-query))
+          (should-not (fumos-completion-query-source-context old-query))
+          (should-not (fumos-completion-query-key old-query))
+          (should-not
+           (memq old-id (fumos-connection-active-request-ids connection)))
+          (should-not
+           (gethash old-id
+                    (fumos-repl--callback-delivery-table connection)))
+          (with-current-buffer (fumos-connection-repl-buffer connection)
+            (should-not
+             (gethash old-id fennel-proto-repl--message-callbacks)))
+          (should
+           (fumos-test-wait-until
+            (lambda ()
+              (memq new-id
+                    (fumos-connection-active-request-ids connection)))))
+          (fumos-eval--invalidate-source-tooling connection source-buffer)
+          (should
+           (hash-table-empty-p
+            (fumos-connection-completion-pending connection)))
+          (should-not (fumos-completion-query-request-id new-query))
+          (should-not (fumos-completion-query-callback-identity new-query))
+          (should-not (fumos-completion-query-repl-buffer new-query))
+          (should-not (fumos-completion-query-source-buffer new-query))
+          (should-not (fumos-completion-query-source-context new-query))
+          (should-not (fumos-completion-query-key new-query))
+          (should-not
+           (memq new-id (fumos-connection-active-request-ids connection)))
+          (should-not
+           (gethash new-id
+                    (fumos-repl--callback-delivery-table connection)))
+          (with-current-buffer (fumos-connection-repl-buffer connection)
+            (should-not
+             (gethash new-id fennel-proto-repl--message-callbacks)))))
+      (fumos-test-assert-eval-settled connection))))
+
+(ert-deftest fumos-completion-late-callbacks-cannot-cross-replacement ()
+  (fumos-test-with-replacement-servers
+      (old replacement old-server new-server)
+    (let* ((file (expand-file-name "scripts/completion.fnl" root))
+           (source nil)
+           old-line old-values old-id new-line new-id late-line late-values)
+      (unwind-protect
+          (progn
+            (make-directory (file-name-directory file) t)
+            (with-temp-file file (insert "same"))
+            (setq source (find-file-noselect file))
+            (with-current-buffer source
+              (unless (eq major-mode 'fennel-mode) (fennel-mode))
+              (setq-local fumos-repl--connection old)
+              (fumos-mode 1)
+              (fumos-repl--link-buffer-to-connection old source))
+            (setf
+             (fumos-test-server-handler old-server)
+             (lambda (_state _client line)
+               (when (and (fumos-test-command-request-p line)
+                          (plist-member
+                           (fumos-test-read-command-request line) :complete))
+                 (setq old-line line))))
+            (with-current-buffer source
+              (let ((fennel-proto-repl-annotate-completion nil))
+                (should-not (fumos-completion-at-point))))
+            (should (fumos-test-wait-until (lambda () old-line)))
+            (setq old-id (fumos-test-wire-message-id old-line))
+            (let* ((key (cons source "same"))
+                   (query
+                    (gethash key
+                             (fumos-connection-completion-pending old)))
+                   (callbacks (fumos-completion-query-callback-identity query)))
+              (should (fumos-completion-query-p query))
+              (should (= old-id (fumos-completion-query-request-id query)))
+              (setq old-values
+                    (fennel-proto-repl-callback-values callbacks)))
+            (setq replacement
+                  (fumos-repl-connect-instance
+                   (fumos-test-instance-for-server
+                    new-server 4242 root "demo" (make-string 64 ?b))))
+            (should
+             (fumos-test-wait-until
+              (lambda ()
+                (and (eq 'ready (fumos-connection-state replacement))
+                     (fumos-connection-macro-cache-valid replacement)))))
+            (with-current-buffer source
+              (setq-local fumos-repl--connection replacement)
+              (fumos-repl--link-buffer-to-connection replacement source))
+            (setf
+             (fumos-test-server-handler new-server)
+             (lambda (_state _client line)
+               (when (and (fumos-test-command-request-p line)
+                          (plist-member
+                           (fumos-test-read-command-request line) :complete))
+                 (if new-line
+                     (setq late-line line)
+                   (setq new-line line)))))
+            (with-current-buffer source
+              (let ((fennel-proto-repl-annotate-completion nil))
+                (should-not (fumos-completion-at-point))))
+            (should (fumos-test-wait-until (lambda () new-line)))
+            (setq new-id (fumos-test-wire-message-id new-line))
+            (should (= old-id new-id))
+            ;; This is the exact upstream callback wrapper captured from the
+            ;; retired transport.  Reusing the numeric ID in the replacement
+            ;; must not make the old callback current again.
+            (funcall old-values '("old-generation"))
+            (should
+             (hash-table-empty-p
+              (fumos-connection-completion-cache old)))
+            (should
+             (hash-table-empty-p
+              (fumos-connection-completion-cache replacement)))
+            (apply #'fumos-test-send-tool-values
+                   (list new-server (fumos-test-server-client new-server)
+                         new-line "complete" '("new-generation")))
+            (fumos-test-assert-eval-settled replacement)
+            (let ((cache
+                   (gethash (cons source "same")
+                            (fumos-connection-completion-cache replacement))))
+              (should (equal '("new-generation")
+                             (fumos-completion-cache-candidates cache))))
+            (with-current-buffer source
+              (erase-buffer)
+              (insert "late")
+              (goto-char (point-max))
+              (let ((fennel-proto-repl-annotate-completion nil))
+                (should-not (fumos-completion-at-point))))
+            (should (fumos-test-wait-until (lambda () late-line)))
+            (let* ((query
+                    (gethash
+                     (cons source "late")
+                     (fumos-connection-completion-pending replacement)))
+                   (callbacks (fumos-completion-query-callback-identity query)))
+              (should (fumos-completion-query-p query))
+              (setq late-values
+                    (fennel-proto-repl-callback-values callbacks)))
+            (fumos-repl--teardown-transport replacement "test teardown")
+            (should
+             (hash-table-empty-p
+              (fumos-connection-completion-pending replacement)))
+            (should
+             (hash-table-empty-p
+              (fumos-connection-completion-cache replacement)))
+            (funcall late-values '("after-teardown"))
+            (should
+             (hash-table-empty-p
+              (fumos-connection-completion-pending replacement)))
+            (should
+             (hash-table-empty-p
+              (fumos-connection-completion-cache replacement))))
+        (when (buffer-live-p source)
+          (with-current-buffer source (set-buffer-modified-p nil))
+          (kill-buffer source))))))
 
 (ert-deftest fumos-fumos-buffers-have-no-upstream-sync-tooling ()
   (fumos-test-with-fennel-file (root file connection server)
     (erase-buffer)
-    (insert "(print demo-value)\n")
+    (insert "(demo-value argument)\n")
     (goto-char (point-min))
-    (search-forward "demo-value")
-    (let ((sync-calls 0)
-          (wait-calls 0))
-      (cl-letf (((symbol-function 'fennel-proto-repl-send-message-sync)
-                 (lambda (&rest _)
-                   (cl-incf sync-calls)
-                   '("demo-value")))
-                ((symbol-function 'accept-process-output)
-                 (lambda (&rest _)
-                   (cl-incf wait-calls)
-                   nil)))
-        ;; The pinned upstream CAPF is the concrete RED: it synchronously
-        ;; issues :complete (and optionally a second :eval for kinds).
-        (run-hook-with-args-until-success 'completion-at-point-functions))
-      (should (= 0 sync-calls))
-      (should (= 0 wait-calls))
-      (should-not (memq #'fennel-proto-repl-complete
-                        completion-at-point-functions))
-      (should-not (memq #'fennel-proto-repl--xref-backend
-                        xref-backend-functions))
-      (should-not (memq #'fennel-proto-repl-eldoc-fn-docstring
-                        eldoc-documentation-functions))
-      (should-not (memq #'fennel-proto-repl-eldoc-var-docstring
-                        eldoc-documentation-functions)))))
+    (search-forward "argument")
+    (let* ((source (current-buffer))
+           (game-repl (fumos-connection-repl-buffer connection))
+           (ordinary-server (fumos-test-server-start))
+           (ordinary-process-buffer
+            (generate-new-buffer " *fumos-ordinary-proto-process*"))
+           (ordinary-repl
+            (generate-new-buffer "*Uninitialized ordinary proto REPL*"))
+           (ordinary-source
+            (generate-new-buffer " *fumos-ordinary-proto-source*"))
+           ordinary-network ordinary-ui
+           ordinary-completion-hooks ordinary-xref-hooks
+           ordinary-eldoc-hooks ordinary-local-map ordinary-minor-map
+           ordinary-alias ordinary-eldoc ordinary-xrefs)
+      (unwind-protect
+          (progn
+            (setf
+             (fumos-test-server-handler ordinary-server)
+             (lambda (state client line)
+               (cond
+                ((fumos-test-eval-request-p line)
+                 (let ((code
+                        (plist-get (fumos-test-read-eval-request line) :eval)))
+                   (fumos-test-send-tool-values
+                    state client line "eval"
+                    (list
+                     (cond
+                      ((string-search "pairs _G" code)
+                       "[\"ordinary-global\"]")
+                      ((string-search "symbol-type" code)
+                       "[\"function\"]")
+                      (t "[argument]"))))))
+                ((fumos-test-command-request-p line)
+                 (let ((request (fumos-test-read-command-request line)))
+                   (cond
+                    ((plist-member request :complete)
+                     (fumos-test-send-tool-values
+                      state client line "complete" '("ordinary-value")))
+                    ((plist-member request :find)
+                     (fumos-test-send-tool-values
+                      state client line "find" (list (concat file ":1"))))))))))
+            (setq ordinary-network
+                  (make-network-process
+                   :name "fumos-ordinary-proto-network"
+                   :buffer ordinary-process-buffer
+                   :host "127.0.0.1"
+                   :service (fumos-test-server-port ordinary-server)
+                   :coding 'utf-8-unix :noquery t
+                   :filter #'fennel-proto-repl--process-filter))
+            (with-current-buffer ordinary-repl
+              (fennel-proto-repl-mode)
+              (fennel-proto-repl--init-callbacks)
+              (setq-local
+               fennel-proto-repl--buffer ordinary-repl
+               fennel-proto-repl--process-buffer ordinary-process-buffer))
+            (with-current-buffer ordinary-process-buffer
+              (setq-local fennel-proto-repl--buffer ordinary-repl)
+              ;; Use upstream's own finalization to create the comint-side
+              ;; process and prompt.  This makes it a live ordinary REPL, not
+              ;; just a buffer wearing `fennel-proto-repl-mode'.
+              (fennel-proto-repl--start-repl
+               'ok "0.6.4" "1.6.1" "LuaJIT 2.1"))
+            (setq ordinary-repl
+                  (buffer-local-value
+                   'fennel-proto-repl--buffer ordinary-process-buffer)
+                  ordinary-ui (get-buffer-process ordinary-repl))
+            (should (process-live-p ordinary-network))
+            (should (process-live-p ordinary-ui))
+            (should (memq ordinary-repl (fennel-proto-repl-live-repls)))
+            (with-current-buffer ordinary-source
+              (setq default-directory root)
+              (fennel-mode)
+              (insert "ordinary")
+              (goto-char (point-max))
+              (setq-local
+               fennel-proto-repl--buffer ordinary-repl
+               fennel-proto-repl-fennel-module-name "ordinary.module")
+              (fennel-proto-repl-minor-mode 1)
+              (setq ordinary-completion-hooks
+                    (copy-sequence completion-at-point-functions)
+                    ordinary-xref-hooks
+                    (copy-sequence xref-backend-functions)
+                    ordinary-eldoc-hooks
+                    (copy-sequence eldoc-documentation-functions)
+                    ordinary-local-map (current-local-map)
+                    ordinary-minor-map
+                    (cdr (assq 'fennel-proto-repl-minor-mode
+                               minor-mode-map-alist))
+                    ordinary-alias fennel-proto-repl-fennel-module-name))
+            (setf
+             (fumos-test-server-handler server)
+             (lambda (state client line)
+               (cond
+                ((fumos-test-eval-request-p line)
+                 (fumos-test-send-tool-values
+                  state client line "eval" '("[argument]")))
+                ((and (fumos-test-command-request-p line)
+                      (plist-member
+                       (fumos-test-read-command-request line) :complete))
+                 (fumos-test-send-tool-values
+                  state client line "complete" '("demo-value"))))))
+            (cl-labels
+                ((assert-owned-hooks
+                  ()
+                  (should
+                   (equal fumos-repl-fennel-module-name
+                          fennel-proto-repl-fennel-module-name))
+                  (should (memq #'fumos-completion-at-point
+                                completion-at-point-functions))
+                  (should (memq #'fumos-repl--xref-backend
+                                xref-backend-functions))
+                  (should (memq #'fumos-eldoc-function
+                                eldoc-documentation-functions))
+                  (dolist (function
+                           '(fennel-proto-repl-complete
+                             fennel-proto-repl--xref-backend
+                             fennel-proto-repl-eldoc-fn-docstring
+                             fennel-proto-repl-eldoc-var-docstring))
+                    (should-not
+                     (memq function
+                           (append completion-at-point-functions
+                                   xref-backend-functions
+                                   eldoc-documentation-functions)))))
+                 (exercise-owned-buffer
+                  ()
+                  (assert-owned-hooks)
+                  (let ((sync-calls 0) (wait-calls 0))
+                    (cl-letf
+                        (((symbol-function
+                           'fennel-proto-repl-send-message-sync)
+                          (lambda (&rest _)
+                            (cl-incf sync-calls)
+                            (ert-fail "FUMOS tooling used sync transport")))
+                         ((symbol-function 'accept-process-output)
+                          (lambda (&rest _)
+                            (cl-incf wait-calls)
+                            (ert-fail "FUMOS tooling entered a wait loop"))))
+                      (font-lock-ensure)
+                      (run-hook-with-args-until-success
+                       'eldoc-documentation-functions #'ignore)
+                      (run-hook-with-args-until-success
+                       'completion-at-point-functions)
+                      (let ((command (key-binding (kbd "M-."))))
+                        (should (eq command #'xref-find-definitions))
+                        (condition-case nil
+                            (funcall command "argument")
+                          (user-error nil))))
+                    (should (= 0 sync-calls))
+                    (should (= 0 wait-calls)))))
+              (with-current-buffer source
+                (exercise-owned-buffer))
+              (fumos-test-assert-eval-settled connection)
+              (with-current-buffer game-repl
+                (let ((inhibit-read-only t))
+                  (goto-char (point-max))
+                  (insert "\ndemo-value"))
+                (goto-char (point-max))
+                (exercise-owned-buffer))
+              (fumos-test-assert-eval-settled connection))
+            ;; FUMOS activity must not rewrite any state in a second, live,
+            ;; ordinary proto source/REPL pair.
+            (with-current-buffer ordinary-source
+              (should (equal "ordinary.module" ordinary-alias))
+              (should (equal ordinary-alias
+                             fennel-proto-repl-fennel-module-name))
+              (should (equal ordinary-completion-hooks
+                             completion-at-point-functions))
+              (should (equal ordinary-xref-hooks xref-backend-functions))
+              (should (equal ordinary-eldoc-hooks
+                             eldoc-documentation-functions))
+              (should (eq ordinary-local-map (current-local-map)))
+              (should
+               (eq ordinary-minor-map
+                   (cdr (assq 'fennel-proto-repl-minor-mode
+                              minor-mode-map-alist))))
+              (should (memq #'fennel-proto-repl-complete
+                            completion-at-point-functions))
+              (should (memq #'fennel-proto-repl--xref-backend
+                            xref-backend-functions))
+              (should (memq #'fennel-proto-repl-eldoc-fn-docstring
+                            eldoc-documentation-functions))
+              (should (memq #'fennel-proto-repl-eldoc-var-docstring
+                            eldoc-documentation-functions))
+              (dolist (function '(fumos-completion-at-point
+                                  fumos-repl--xref-backend
+                                  fumos-eldoc-function))
+                (should-not
+                 (memq function
+                       (append completion-at-point-functions
+                               xref-backend-functions
+                               eldoc-documentation-functions)))))
+            (setf (fumos-test-server-lines ordinary-server) nil)
+            (with-current-buffer ordinary-source
+              (setq-local
+               font-lock-mode t
+               fennel-proto-repl-font-lock-dynamically '(global))
+              (fennel-proto-repl-refresh-dynamic-font-lock)
+              (erase-buffer)
+              (insert "(ordinary-fn argument)")
+              (search-backward "argument")
+              (goto-char (match-end 0))
+              (run-hook-with-args-until-success
+               'eldoc-documentation-functions
+               (lambda (&rest values) (setq ordinary-eldoc values)))
+              (erase-buffer)
+              (insert "ordinary")
+              (goto-char (point-max))
+              (let ((capf
+                     (run-hook-with-args-until-success
+                      'completion-at-point-functions)))
+                (should capf)
+                (should
+                 (equal '("ordinary-value")
+                        (all-completions "ordinary" (nth 2 capf)))))
+              (let ((xref-show-definitions-function
+                     (lambda (fetcher _alist)
+                       (setq ordinary-xrefs (funcall fetcher)))))
+                (cl-letf (((symbol-function 'xref-push-marker-stack) #'ignore))
+                  (funcall (key-binding (kbd "M-.")) "ordinary"))))
+            (should ordinary-eldoc)
+            (should (= 1 (length ordinary-xrefs)))
+            (let ((transcript
+                   (mapcar
+                    (lambda (line)
+                      (if (fumos-test-eval-request-p line)
+                          :eval
+                        (let ((request
+                               (fumos-test-read-command-request line)))
+                          (cond ((plist-member request :complete) :complete)
+                                ((plist-member request :find) :find)
+                                (t :unknown)))))
+                    (fumos-test-server-lines ordinary-server))))
+              (should (equal '(:eval :eval :complete :eval :find)
+                             transcript)))
+            (with-current-buffer ordinary-source
+              (should (equal ordinary-alias
+                             fennel-proto-repl-fennel-module-name))
+              (should (equal ordinary-completion-hooks
+                             completion-at-point-functions))
+              (should (equal ordinary-xref-hooks xref-backend-functions))
+              (should (equal ordinary-eldoc-hooks
+                             eldoc-documentation-functions))
+              (should (eq ordinary-local-map (current-local-map)))
+              (should
+               (eq ordinary-minor-map
+                   (cdr (assq 'fennel-proto-repl-minor-mode
+                              minor-mode-map-alist)))))
+        (when (process-live-p ordinary-ui) (delete-process ordinary-ui))
+        (when (process-live-p ordinary-network)
+          (delete-process ordinary-network))
+        (dolist (buffer (list ordinary-source ordinary-repl
+                              ordinary-process-buffer))
+          (when (buffer-live-p buffer)
+            (with-current-buffer buffer (set-buffer-modified-p nil))
+            (kill-buffer buffer)))
+        (fumos-test-server-stop ordinary-server))))))
 
 (provide 'fumos-eval-test)
 ;;; fumos-eval-test.el ends here

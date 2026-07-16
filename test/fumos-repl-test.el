@@ -5,6 +5,7 @@
 (require 'seq)
 (require 'support/fake-fumos-server)
 (require 'fumos-repl)
+(require 'fumos-eval)
 
 (defconst fumos-test-golden-ack
   (concat "FUMOS/1 OK pid=4242 proto=0.6.4 "
@@ -1030,6 +1031,76 @@
        (fumos-test-server-stop ,first-server)
        (delete-directory second-root t)
        (delete-directory first-root t))))
+
+(defun fumos-test-source-editing-state ()
+  "Return the source tooling state relevant to FUMOS ownership."
+  (list completion-at-point-functions
+        xref-backend-functions
+        eldoc-documentation-functions))
+
+(defun fumos-test-prepare-ordinary-source
+    (source target module completion xref eldoc)
+  "Give SOURCE one exact active ordinary proto configuration using TARGET."
+  (with-current-buffer target
+    (fennel-proto-repl-mode))
+  (with-current-buffer source
+    (fennel-mode)
+    (setq-local fennel-proto-repl-fennel-module-name module
+                fennel-proto-repl--buffer target
+                fennel-proto-repl-minor-mode t
+                fennel-proto-repl-font-lock-dynamically nil
+                completion-at-point-functions (list completion)
+                xref-backend-functions (list xref)
+                eldoc-documentation-functions (list eldoc))
+    (fumos-test-source-editing-state)))
+
+(defun fumos-test-assert-source-ordinary
+    (source target module editing connections)
+  "Assert SOURCE exactly restored ordinary state and left CONNECTIONS."
+  (with-current-buffer source
+    (should-not fumos-repl--source-owner)
+    (should (eq target fennel-proto-repl--buffer))
+    (should fennel-proto-repl-minor-mode)
+    (should (local-variable-p 'fennel-proto-repl-fennel-module-name))
+    (should (equal module fennel-proto-repl-fennel-module-name))
+    (should (equal editing (fumos-test-source-editing-state)))
+    (should-not (memq #'fumos-completion-at-point
+                      completion-at-point-functions))
+    (should-not (memq #'fumos-repl--xref-backend
+                      xref-backend-functions))
+    (should-not (memq #'fumos-eldoc-function
+                      eldoc-documentation-functions)))
+  (dolist (connection connections)
+    (should-not (memq source
+                      (fumos-connection-linked-buffers connection)))))
+
+(defun fumos-test-assert-source-owned-by (source connection)
+  "Assert SOURCE has one complete link transaction owned by CONNECTION."
+  (with-current-buffer source
+    (should (eq connection fumos-repl--source-owner))
+    (should
+     (eq (fumos-connection-repl-buffer connection)
+         fennel-proto-repl--buffer))
+    (should (equal fumos-repl-fennel-module-name
+                   fennel-proto-repl-fennel-module-name))
+    (should (memq #'fumos-completion-at-point
+                  completion-at-point-functions))
+    (should-not (memq #'fennel-proto-repl-complete
+                      completion-at-point-functions))
+    (should (memq #'fumos-repl--xref-backend
+                  xref-backend-functions))
+    (should-not (memq #'fennel-proto-repl--xref-backend
+                      xref-backend-functions))
+    (should (memq #'fumos-eldoc-function
+                  eldoc-documentation-functions))
+    (should-not (memq #'fennel-proto-repl-eldoc-fn-docstring
+                      eldoc-documentation-functions))
+    (should-not (memq #'fennel-proto-repl-eldoc-var-docstring
+                      eldoc-documentation-functions)))
+  (should (memq source (fumos-connection-linked-buffers connection)))
+  (should (= 1 (cl-count source
+                         (fumos-connection-linked-buffers connection)
+                         :test #'eq))))
 
 (defun fumos-test-install-retry-pair (connection label)
   "Install real outer/embedded callbacks on CONNECTION for LABEL."
@@ -2141,6 +2212,893 @@
         (should (equal "poison.module"
                        fennel-proto-repl-fennel-module-name))))))
 
+(ert-deftest fumos-source-reserved-module-name-is-on-the-wire ()
+  (let ((original-default
+         (default-value 'fennel-proto-repl-fennel-module-name))
+        (decoy (copy-sequence "global.default.decoy")))
+    (unwind-protect
+        (progn
+          (set-default 'fennel-proto-repl-fennel-module-name decoy)
+          (fumos-test-with-two-ready-connections
+              (first first-server second second-server)
+            (let ((ordinary-repl
+                   (generate-new-buffer " *fumos-alias-ordinary-repl*"))
+                  sources kill-observation)
+              (cl-labels
+                  ((default-unchanged-p
+                    ()
+                    (eq decoy
+                        (default-value
+                         'fennel-proto-repl-fennel-module-name)))
+                   (make-source
+                    (name local-p value)
+                    (let* ((file (expand-file-name
+                                  (format "scripts/%s.fnl" name) first-root))
+                           (buffer
+                            (generate-new-buffer
+                             (format " *fumos-alias-%s*" name))))
+                      (make-directory (file-name-directory file) t)
+                      (with-temp-file file (insert "(demo-fn argument)\n"))
+                      (with-current-buffer buffer
+                        (setq buffer-file-name file
+                              default-directory (file-name-directory file))
+                        (insert-file-contents file)
+                        ;; Activate the real source mode without letting its
+                        ;; project hook link before this case installs the
+                        ;; ordinary alias snapshot under test.
+                        (let ((fumos-repl--connections
+                               (make-hash-table :test #'equal)))
+                          (fennel-mode))
+                        (fumos-mode 1)
+                        (if local-p
+                            (set (make-local-variable
+                                  'fennel-proto-repl-fennel-module-name)
+                                 value)
+                          (kill-local-variable
+                           'fennel-proto-repl-fennel-module-name))
+                        (set-buffer-modified-p nil))
+                      (push buffer sources)
+                      buffer))
+                   (reserved-p
+                    (buffer connection)
+                    (with-current-buffer buffer
+                      (and
+                       (eq connection fumos-repl--source-owner)
+                       (local-variable-p
+                        'fennel-proto-repl-fennel-module-name)
+                       (equal fumos-repl-fennel-module-name
+                              fennel-proto-repl-fennel-module-name))))
+                   (restored-p
+                    (buffer local-p value)
+                    (with-current-buffer buffer
+                      (and
+                       (eq local-p
+                           (local-variable-p
+                            'fennel-proto-repl-fennel-module-name))
+                       (eq value
+                           fennel-proto-repl-fennel-module-name)))))
+                (unwind-protect
+                    (progn
+                      (fumos-test-make-project-root first-root)
+                      (with-current-buffer ordinary-repl
+                        (fennel-proto-repl-mode))
+                      (dolist (connection (list first second))
+                        (with-current-buffer
+                            (fumos-connection-repl-buffer connection)
+                          (should
+                           (local-variable-p
+                            'fennel-proto-repl-fennel-module-name))
+                          (should
+                           (equal fumos-repl-fennel-module-name
+                                  fennel-proto-repl-fennel-module-name))))
+                      (should (default-unchanged-p))
+
+                      (let* ((initial (copy-sequence "source.initial.local"))
+                             (source (make-source "transfer" t initial))
+                             (before
+                              (length (fumos-test-server-lines first-server))))
+                        (fumos-repl--link-buffer-to-connection first source)
+                        (should (reserved-p source first))
+                        (setf
+                         (fumos-test-server-handler first-server)
+                         (lambda (server client line)
+                           (when (and (string-match-p ":eval " line)
+                                      (fumos-test-wire-message-id line))
+                             (let ((id (fumos-test-wire-message-id line)))
+                               (fumos-test-server-send
+                                server
+                                (format
+                                 (concat "(:id %d :op \"accept\")\n"
+                                         "(:id %d :op \"eval\" "
+                                         ":values (\"[argument]\"))\n"
+                                         "(:id %d :op \"done\")\n")
+                                 id id id)
+                                client)))))
+                        (with-current-buffer source
+                          (goto-char (point-min))
+                          (search-forward "demo-fn")
+                          (should (integerp (fumos-show-arglist "demo-fn")))
+                          (cl-letf
+                              (((symbol-function
+                                 'fennel-proto-repl--eldoc-fn-in-current-sexp)
+                                (lambda () nil)))
+                            (should (fumos-eldoc-function #'ignore))))
+                        (should
+                         (fumos-test-wait-until
+                          (lambda ()
+                            (and
+                             (>= (length
+                                  (fumos-test-server-lines first-server))
+                                 (+ before 2))
+                             (fumos-test-command-settled-p first)))))
+                        (let ((wire
+                               (seq-filter
+                                (lambda (line)
+                                  (and (string-match-p ":eval " line)
+                                       (string-match-p ":file " line)))
+                                (nthcdr
+                                 before
+                                 (fumos-test-server-lines first-server)))))
+                          (should (= 2 (length wire)))
+                          (dolist (line wire)
+                            (should
+                             (string-match-p
+                              (regexp-quote
+                               "(require \\\"fumos.repl.fennel\\\")")
+                              line))
+                            (should-not
+                             (string-match-p (regexp-quote decoy) line))))
+                        (fumos-repl--link-buffer-to-connection second source)
+                        (should (reserved-p source second))
+                        (should-not
+                         (memq source (fumos-connection-linked-buffers first)))
+                        (should
+                         (eq initial
+                             (with-current-buffer source
+                               fumos-repl--source-previous-module-value)))
+                        (with-current-buffer source
+                          (should (eq second
+                                      (fumos-repl-unlink-current-buffer))))
+                        (should (restored-p source t initial))
+                        (should (default-unchanged-p)))
+
+                      (let ((source (make-source "disable" nil decoy)))
+                        (fumos-repl--link-buffer-to-connection first source)
+                        (should (reserved-p source first))
+                        (with-current-buffer source (fumos-mode -1))
+                        (should (restored-p source nil decoy))
+                        (should (default-unchanged-p)))
+
+                      (let* ((initial (copy-sequence "ordinary.initial.local"))
+                             (source (make-source "ordinary" t initial)))
+                        (fumos-repl--link-buffer-to-connection first source)
+                        (with-current-buffer source
+                          (fennel-proto-repl--link-buffer ordinary-repl)
+                          (should-not fumos-repl--source-owner)
+                          (should (eq ordinary-repl fennel-proto-repl--buffer))
+                          (should fennel-proto-repl-minor-mode)
+                          (should (memq #'fennel-proto-repl-complete
+                                        completion-at-point-functions))
+                          (should (memq #'fennel-proto-repl--xref-backend
+                                        xref-backend-functions))
+                          (should
+                           (memq #'fennel-proto-repl-eldoc-fn-docstring
+                                 eldoc-documentation-functions))
+                          (should
+                           (memq #'fennel-proto-repl-eldoc-var-docstring
+                                 eldoc-documentation-functions)))
+                        (should (restored-p source t initial))
+                        (should (default-unchanged-p)))
+
+                      (let ((source (make-source "kill" nil decoy)))
+                        (fumos-repl--link-buffer-to-connection first source)
+                        (with-current-buffer source
+                          (add-hook
+                           'kill-buffer-hook
+                           (lambda ()
+                             (setq kill-observation
+                                   (list
+                                    fumos-repl--source-owner
+                                    (local-variable-p
+                                     'fennel-proto-repl-fennel-module-name)
+                                    fennel-proto-repl-fennel-module-name
+                                    (default-unchanged-p))))
+                           t t)
+                          (kill-buffer source))
+                        (should (equal (list nil nil decoy t)
+                                       kill-observation)))
+                      (should (default-unchanged-p)))
+                  (dolist (buffer (cons ordinary-repl sources))
+                    (when (buffer-live-p buffer)
+                      (with-current-buffer buffer
+                        (set-buffer-modified-p nil))
+                      (kill-buffer buffer))))))))
+      (set-default 'fennel-proto-repl-fennel-module-name
+                   original-default))))
+
+(ert-deftest fumos-dynamic-global-font-lock-never-enters-sync-query ()
+  (let ((original-default
+         (default-value 'fennel-proto-repl-font-lock-dynamically))
+        (default-config (list 'global 'scoped-macro)))
+    (unwind-protect
+        (progn
+          (set-default 'fennel-proto-repl-font-lock-dynamically
+                       default-config)
+          (fumos-test-with-two-ready-connections
+              (first first-server second second-server)
+            (let ((ordinary-repl
+                  (generate-new-buffer " *fumos-font-lock-ordinary-repl*"))
+                  sources kill-observation (sync-calls 0) (wait-calls 0))
+              (cl-labels
+                  ((default-unchanged-p
+                    ()
+                    (eq default-config
+                        (default-value
+                         'fennel-proto-repl-font-lock-dynamically)))
+                   (make-source
+                    (name local-p value)
+                    (let* ((file (expand-file-name
+                                  (format "scripts/%s.fnl" name) first-root))
+                           (buffer
+                            (generate-new-buffer
+                             (format " *fumos-font-lock-%s*" name))))
+                      (make-directory (file-name-directory file) t)
+                      (with-temp-file file
+                        (insert "(local ordinary-macro (fn [] nil))\n"))
+                      (with-current-buffer buffer
+                        (setq buffer-file-name file
+                              default-directory (file-name-directory file))
+                        (insert-file-contents file)
+                        (let ((fumos-repl--connections
+                               (make-hash-table :test #'equal)))
+                          (fennel-mode))
+                        (font-lock-mode 1)
+                        ;; Batch Emacs may defer global font-lock activation;
+                        ;; force the buffer-local gate used by upstream refresh.
+                        (setq-local font-lock-mode t)
+                        (fumos-mode 1)
+                        (if local-p
+                            (set (make-local-variable
+                                  'fennel-proto-repl-font-lock-dynamically)
+                                 value)
+                          (kill-local-variable
+                           'fennel-proto-repl-font-lock-dynamically))
+                        (set-buffer-modified-p nil))
+                      (push buffer sources)
+                      buffer))
+                   (owned-config-p
+                    (source connection)
+                    (with-current-buffer source
+                      (and
+                       (eq connection fumos-repl--source-owner)
+                       (local-variable-p
+                        'fennel-proto-repl-font-lock-dynamically)
+                       (equal '(scoped-macro)
+                              fennel-proto-repl-font-lock-dynamically))))
+                   (restored-config-p
+                    (source local-p value)
+                    (with-current-buffer source
+                      (and
+                       (eq local-p
+                           (local-variable-p
+                            'fennel-proto-repl-font-lock-dynamically))
+                       (eq value
+                           fennel-proto-repl-font-lock-dynamically))))
+                   (poison-sync
+                    (&rest _)
+                    (cl-incf sync-calls)
+                    nil)
+                   (poison-wait
+                    (&rest _)
+                    (cl-incf wait-calls)
+                    nil))
+                (unwind-protect
+                    (progn
+                      (with-current-buffer ordinary-repl
+                        (fennel-proto-repl-mode))
+                      (let ((source (make-source "default-transfer"
+                                                 nil default-config)))
+                        (cl-letf
+                            (((symbol-function
+                               'fennel-proto-repl-send-message-sync)
+                              #'poison-sync)
+                             ((symbol-function 'accept-process-output)
+                              #'poison-wait))
+                          (fumos-repl--link-buffer-to-connection first source)
+                          (should (owned-config-p source first))
+                          ;; Task 8's asynchronous cache callback commits through
+                          ;; this exact production function before refreshing all
+                          ;; still-owned source buffers.
+                          (let ((process (fumos-connection-process first))
+                                (generation
+                                 (fumos-connection-generation first))
+                                (repl (fumos-connection-repl-buffer first)))
+                            (setf
+                             (fumos-connection-macro-refresh-pending first) t
+                             (fumos-connection-macro-refresh-id first) 700
+                             (fumos-connection-macro-refresh-generation first)
+                             generation)
+                            (cl-letf
+                                (((symbol-function
+                                   'fumos-repl--macro-refresh-current-p)
+                                  (lambda (&rest _) t)))
+                              (fumos-repl--complete-macro-refresh
+                               first process generation repl 1 700 'callback
+                               '("[[\"game.macros\" \"defwave\"]]"))))
+                          (with-current-buffer source
+                            (fennel-proto-repl-refresh-dynamic-font-lock))
+                          (fumos-repl--link-buffer-to-connection second source)
+                          (should (owned-config-p source second)))
+                        (should (= 0 sync-calls))
+                        (should (= 0 wait-calls))
+                        (with-current-buffer source
+                          (should (eq second
+                                      (fumos-repl-unlink-current-buffer))))
+                        (should (restored-config-p source nil default-config))
+                        (should (default-unchanged-p)))
+
+                      (let* ((local-config
+                              (list 'global 'scoped-macro))
+                             (source
+                              (make-source "local-disable" t local-config)))
+                        (cl-letf
+                            (((symbol-function
+                               'fennel-proto-repl-send-message-sync)
+                              #'poison-sync)
+                             ((symbol-function 'accept-process-output)
+                              #'poison-wait))
+                          (fumos-repl--link-buffer-to-connection first source)
+                          (should (owned-config-p source first))
+                          (with-current-buffer source (fumos-mode -1)))
+                        (should (= 0 sync-calls))
+                        (should (= 0 wait-calls))
+                        (should (restored-config-p source t local-config))
+                        (should (default-unchanged-p)))
+
+                      (let* ((local-config
+                              (list 'global 'scoped-macro))
+                             (source
+                              (make-source "ordinary-relink-reentry"
+                                           t local-config))
+                             (independent
+                              (make-source "ordinary-relink-independent"
+                                           t local-config))
+                             reentered independent-outcome reentry-sync-calls)
+                        (with-current-buffer independent
+                          (fumos-mode -1)
+                          (setq-local
+                           fennel-proto-repl--buffer ordinary-repl
+                           fennel-proto-repl-minor-mode t))
+                        (cl-letf
+                            (((symbol-function
+                               'fennel-proto-repl-send-message-sync)
+                              (lambda (&rest args)
+                                (push
+                                 (list (current-buffer)
+                                       fumos-repl--source-owner
+                                       fennel-proto-repl--buffer
+                                       (cadr args))
+                                 reentry-sync-calls)
+                                (when (and (eq (current-buffer) source)
+                                           (not reentered))
+                                  (setq reentered t)
+                                  ;; A real synchronous wait can dispatch an
+                                  ;; attach callback before returning.
+                                  (fumos-repl--link-buffer-to-connection
+                                   second source)
+                                  ;; The dynamic guard must not reject an
+                                  ;; unrelated ordinary buffer active in the
+                                  ;; same wait window.
+                                  (setq
+                                   independent-outcome
+                                   (with-current-buffer independent
+                                     (condition-case caught
+                                         (list
+                                          :ok
+                                          (fennel-proto-repl-send-message-sync
+                                           :eval "independent ordinary"))
+                                       (error
+                                        (list :error
+                                              (error-message-string
+                                               caught)))))))
+                                '("[\"ordinary-global\"]")))
+                             ((symbol-function 'accept-process-output)
+                              #'poison-wait))
+                          (fumos-repl--link-buffer-to-connection first source)
+                          (with-current-buffer source
+                            (fennel-proto-repl--link-buffer ordinary-repl)
+                            (should (eq second fumos-repl--source-owner))
+                            (should
+                             (eq (fumos-connection-repl-buffer second)
+                                 fennel-proto-repl--buffer))))
+                        (should reentered)
+                        (should
+                         (equal '(:ok ("[\"ordinary-global\"]"))
+                                independent-outcome))
+                        (should (= 2 (length reentry-sync-calls)))
+                        (dolist (buffer (list source independent))
+                          (let ((call
+                                 (seq-find
+                                  (lambda (entry) (eq buffer (car entry)))
+                                  reentry-sync-calls)))
+                            (should call)
+                            (should-not (nth 1 call))
+                            (should (eq ordinary-repl (nth 2 call)))))
+                        (should (owned-config-p source second))
+                        (with-current-buffer source
+                          (should
+                           (eq second (fumos-repl-unlink-current-buffer))))
+                        (should (restored-config-p source t local-config))
+                        (should (default-unchanged-p)))
+
+                      (let* ((local-config
+                              (list 'global 'scoped-macro))
+                             (source
+                              (make-source "ordinary-relink" t local-config))
+                             transition-sync-owners)
+                        (cl-letf
+                            (((symbol-function
+                               'fennel-proto-repl-send-message-sync)
+                              (lambda (&rest args)
+                                (push fumos-repl--source-owner
+                                      transition-sync-owners)
+                                (if (string-match-p
+                                     "macro-loaded" (or (cadr args) ""))
+                                    '("nil")
+                                  '("[\"ordinary-global\"]"))))
+                             ((symbol-function 'accept-process-output)
+                              #'poison-wait))
+                          (fumos-repl--link-buffer-to-connection first source)
+                          (with-current-buffer source
+                            (fennel-proto-repl--link-buffer ordinary-repl)
+                            (should-not fumos-repl--source-owner)
+                            (should
+                             (eq ordinary-repl fennel-proto-repl--buffer))))
+                        (should transition-sync-owners)
+                        (should (seq-every-p #'null transition-sync-owners))
+                        (should (= 0 sync-calls))
+                        (should (= 0 wait-calls))
+                        (should (restored-config-p source t local-config))
+                        (should (default-unchanged-p)))
+
+                      (let* ((local-config
+                              (list 'global 'scoped-macro))
+                             (source
+                              (make-source "ordinary-select-relink"
+                                           t local-config))
+                             selected-sync-owners)
+                        (cl-letf
+                            (((symbol-function
+                               'fennel-proto-repl--select-repl)
+                              (lambda () ordinary-repl))
+                             ((symbol-function
+                               'fennel-proto-repl-send-message-sync)
+                              (lambda (&rest args)
+                                (push fumos-repl--source-owner
+                                      selected-sync-owners)
+                                (if (string-match-p
+                                     "macro-loaded" (or (cadr args) ""))
+                                    '("nil")
+                                  '("[\"ordinary-global\"]"))))
+                             ((symbol-function 'accept-process-output)
+                              #'poison-wait))
+                          (fumos-repl--link-buffer-to-connection first source)
+                          (with-current-buffer source
+                            (fennel-proto-repl--link-buffer)
+                            (should-not fumos-repl--source-owner)
+                            (should
+                             (eq ordinary-repl fennel-proto-repl--buffer))))
+                        (should selected-sync-owners)
+                        (should (seq-every-p #'null selected-sync-owners))
+                        (should (= 0 sync-calls))
+                        (should (= 0 wait-calls))
+                        (should (restored-config-p source t local-config))
+                        (should (default-unchanged-p)))
+
+                      (let ((source
+                             (make-source "kill" nil default-config)))
+                        (cl-letf
+                            (((symbol-function
+                               'fennel-proto-repl-send-message-sync)
+                              #'poison-sync)
+                             ((symbol-function 'accept-process-output)
+                              #'poison-wait))
+                          (fumos-repl--link-buffer-to-connection first source))
+                        (should (= 0 sync-calls))
+                        (should (= 0 wait-calls))
+                        (with-current-buffer source
+                          (add-hook
+                           'kill-buffer-hook
+                           (lambda ()
+                             (setq kill-observation
+                                   (list
+                                    fumos-repl--source-owner
+                                    (local-variable-p
+                                     'fennel-proto-repl-font-lock-dynamically)
+                                    fennel-proto-repl-font-lock-dynamically
+                                    (default-unchanged-p))))
+                           t t)
+                          (kill-buffer source))
+                        (should (equal (list nil nil default-config t)
+                                       kill-observation)))
+
+                      (let* ((rollback-config
+                              (list 'global 'scoped-macro))
+                             (source
+                              (make-source "setup-rollback"
+                                           t rollback-config))
+                             (original-install
+                              (symbol-function
+                               'fumos-repl--install-owned-editing-state)))
+                        (cl-letf
+                            (((symbol-function
+                               'fennel-proto-repl-send-message-sync)
+                              #'poison-sync)
+                             ((symbol-function 'accept-process-output)
+                              #'poison-wait)
+                             ((symbol-function
+                               'fumos-repl--install-owned-editing-state)
+                              (lambda ()
+                                (funcall original-install)
+                                (error "font-lock setup rollback"))))
+                          (should-error
+                           (fumos-repl--link-buffer-to-connection first source)
+                           :type 'error))
+                        (should (= 0 sync-calls))
+                        (should (= 0 wait-calls))
+                        (should-not
+                         (memq source
+                               (fumos-connection-linked-buffers first)))
+                        (should (restored-config-p source t rollback-config))
+                        (with-current-buffer source
+                          (should-not fumos-repl--source-owner))
+                        (should (default-unchanged-p)))
+
+                      (let* ((ordinary-config
+                              (list 'global 'scoped-macro))
+                             (source
+                              (make-source "ordinary-proto"
+                                           t ordinary-config))
+                             ordinary-sync-calls)
+                        (with-current-buffer source (fumos-mode -1))
+                        (cl-letf
+                            (((symbol-function
+                               'fennel-proto-repl-send-message-sync)
+                              (lambda (&rest args)
+                                (push (cons fumos-repl--source-owner args)
+                                      ordinary-sync-calls)
+                                (if (string-match-p
+                                     "macro-loaded" (or (cadr args) ""))
+                                    '("nil")
+                                  '("[\"ordinary-global\"]"))))
+                             ((symbol-function 'accept-process-output)
+                              (lambda (&rest _)
+                                (ert-fail
+                                 "stubbed ordinary sync unexpectedly waited"))))
+                          (with-current-buffer source
+                            (should font-lock-mode)
+                            (should (eq ordinary-config
+                                        fennel-proto-repl-font-lock-dynamically))
+                            (setq-local fennel-proto-repl--buffer
+                                        ordinary-repl)
+                            (fennel-proto-repl-minor-mode 1)
+                            (fennel-proto-repl--link-buffer ordinary-repl)
+                            (fennel-proto-repl-refresh-dynamic-font-lock)))
+                        (should ordinary-sync-calls)
+                        (should (seq-every-p
+                                 (lambda (call) (null (car call)))
+                                 ordinary-sync-calls))
+                        (should (restored-config-p source t ordinary-config))
+                        (should (memq 'global ordinary-config))
+                        (should (default-unchanged-p)))
+                      (should (= 0 sync-calls))
+                      (should (= 0 wait-calls)))
+                  (dolist (buffer (cons ordinary-repl sources))
+                    (when (buffer-live-p buffer)
+                      (with-current-buffer buffer
+                        (set-buffer-modified-p nil))
+                      (kill-buffer buffer))))))))
+      (set-default 'fennel-proto-repl-font-lock-dynamically
+                   original-default))))
+
+(ert-deftest fumos-ordinary-relink-restores-custom-active-tooling-exactly ()
+  (fumos-test-with-two-ready-connections
+      (first first-server second second-server)
+    (let* ((file (expand-file-name "scripts/custom-tooling.fnl" first-root))
+           (source (generate-new-buffer " *fumos-custom-tooling-source*"))
+           (ordinary-repl
+            (generate-new-buffer " *fumos-custom-tooling-repl*"))
+           (capf (lambda () nil))
+           (xref (lambda () nil))
+           (eldoc (lambda (&rest _) nil))
+           snapshot)
+      (unwind-protect
+          (progn
+            (make-directory (file-name-directory file) t)
+            (with-temp-file file (insert "(custom-tooling)\n"))
+            (with-current-buffer ordinary-repl
+              (fennel-proto-repl-mode))
+            (with-current-buffer source
+              (setq buffer-file-name file
+                    default-directory (file-name-directory file))
+              (insert-file-contents file)
+              (let ((fumos-repl--connections
+                     (make-hash-table :test #'equal)))
+                (fennel-mode))
+              (fumos-mode 1)
+              (setq-local
+               fennel-proto-repl--buffer ordinary-repl
+               fennel-proto-repl-font-lock-dynamically nil)
+              (let ((fennel-proto-repl-project-integration nil))
+                (fennel-proto-repl-minor-mode 1))
+              ;; An active ordinary mode may intentionally replace every
+              ;; upstream provider with custom cache-only tooling.
+              (setq-local completion-at-point-functions (list capf)
+                          xref-backend-functions (list xref)
+                          eldoc-documentation-functions (list eldoc))
+              (setq snapshot
+                    (list completion-at-point-functions
+                          xref-backend-functions
+                          eldoc-documentation-functions))
+              (fumos-repl--link-buffer-to-connection first source)
+              (should-not fumos-repl--source-enabled-upstream-mode)
+              (fennel-proto-repl--link-buffer ordinary-repl)
+              (should-not fumos-repl--source-owner)
+              (should fennel-proto-repl-minor-mode)
+              (should (eq ordinary-repl fennel-proto-repl--buffer))
+              (should
+               (equal snapshot
+                      (list completion-at-point-functions
+                            xref-backend-functions
+                            eldoc-documentation-functions)))))
+        (dolist (buffer (list source ordinary-repl))
+          (when (buffer-live-p buffer)
+            (with-current-buffer buffer (set-buffer-modified-p nil))
+            (kill-buffer buffer)))))))
+
+(ert-deftest fumos-release-module-watcher-newer-owner-wins ()
+  (fumos-test-with-two-ready-connections
+      (first first-server second second-server)
+    (let* ((file (expand-file-name "scripts/release-reentry.fnl" first-root))
+           (source (generate-new-buffer " *fumos-release-reentry-source*"))
+           watcher watcher-ran release-result)
+      (unwind-protect
+          (progn
+            (make-directory (file-name-directory file) t)
+            (with-temp-file file (insert "(release-reentry)\n"))
+            (with-current-buffer source
+              (setq buffer-file-name file
+                    default-directory (file-name-directory file))
+              (insert-file-contents file)
+              (let ((fumos-repl--connections
+                     (make-hash-table :test #'equal)))
+                (fennel-mode))
+              (fumos-mode 1)
+              (setq-local fennel-proto-repl-fennel-module-name
+                          "ordinary.module")
+              (set-buffer-modified-p nil))
+            (fumos-repl--link-buffer-to-connection first source)
+            (setq
+             watcher
+             (lambda (_symbol new-value operation where)
+               (when (and (eq operation 'set) (eq where source)
+                          (equal new-value "ordinary.module")
+                          (not watcher-ran))
+                 (setq watcher-ran t)
+                 (remove-variable-watcher
+                  'fennel-proto-repl-fennel-module-name watcher)
+                 (fumos-repl--link-buffer-to-connection second source))))
+            (add-variable-watcher
+             'fennel-proto-repl-fennel-module-name watcher)
+            (with-current-buffer source
+              (setq release-result (fumos-repl-unlink-current-buffer))
+              (should watcher-ran)
+              (should (eq first release-result))
+              (should (eq second fumos-repl--source-owner))
+              (should
+               (eq (fumos-connection-repl-buffer second)
+                   fennel-proto-repl--buffer))
+              (should (equal fumos-repl-fennel-module-name
+                             fennel-proto-repl-fennel-module-name))
+              (should (memq #'fumos-completion-at-point
+                            completion-at-point-functions))
+              (should (memq #'fumos-repl--xref-backend
+                            xref-backend-functions))
+              (should (memq #'fumos-eldoc-function
+                            eldoc-documentation-functions))
+              (should
+               (equal "ordinary.module"
+                      fumos-repl--source-previous-module-value))
+              (should fumos-repl--source-previous-module-local-p)
+              (should (eq second (fumos-repl-unlink-current-buffer)))
+              (should-not fumos-repl--source-owner)
+              (should-not fennel-proto-repl--buffer)
+              (should-not fennel-proto-repl-minor-mode)
+              (should (equal "ordinary.module"
+                             fennel-proto-repl-fennel-module-name)))
+            (should-not
+             (memq source (fumos-connection-linked-buffers first)))
+            (should-not
+             (memq source (fumos-connection-linked-buffers second))))
+        (when watcher
+          (remove-variable-watcher
+           'fennel-proto-repl-fennel-module-name watcher))
+        (when (buffer-live-p source)
+          (with-current-buffer source
+            (when fumos-repl--source-owner
+              (fumos-repl-unlink-current-buffer))
+            (set-buffer-modified-p nil))
+          (kill-buffer source))))))
+
+(ert-deftest fumos-release-owner-watcher-newer-owner-wins ()
+  (fumos-test-with-two-ready-connections
+      (first first-server second second-server)
+    (let* ((source (generate-new-buffer " *fumos-release-owner-source*"))
+           (capf (lambda () nil))
+           (xref (lambda () nil))
+           (eldoc (lambda (&rest _) nil))
+           watcher watcher-ran ordinary-editing)
+      (unwind-protect
+          (progn
+            (with-current-buffer source
+              (fennel-mode)
+              (setq-local fennel-proto-repl-fennel-module-name
+                          "ordinary.owner.module"
+                          completion-at-point-functions (list capf)
+                          xref-backend-functions (list xref)
+                          eldoc-documentation-functions (list eldoc))
+              (setq ordinary-editing (fumos-test-source-editing-state)))
+            (fumos-repl--link-buffer-to-connection first source)
+            (setq
+             watcher
+             (lambda (_symbol new-value operation where)
+               (when (and (eq operation 'set) (eq where source)
+                          (null new-value) (not watcher-ran))
+                 (setq watcher-ran t)
+                 (remove-variable-watcher
+                  'fumos-repl--source-owner watcher)
+                 (fumos-repl--link-buffer-to-connection second source))))
+            (add-variable-watcher 'fumos-repl--source-owner watcher)
+            (with-current-buffer source
+              (should (eq first (fumos-repl-unlink-current-buffer)))
+              (should watcher-ran))
+            (fumos-test-assert-source-owned-by source second)
+            (should-not
+             (memq source (fumos-connection-linked-buffers first)))
+            (with-current-buffer source
+              (should (eq second (fumos-repl-unlink-current-buffer)))
+              (should-not fumos-repl--source-owner)
+              (should-not fennel-proto-repl--buffer)
+              (should-not fennel-proto-repl-minor-mode)
+              (should (equal "ordinary.owner.module"
+                             fennel-proto-repl-fennel-module-name))
+              (should (equal ordinary-editing
+                             (fumos-test-source-editing-state))))
+            (should-not
+             (memq source (fumos-connection-linked-buffers second))))
+        (when watcher
+          (remove-variable-watcher 'fumos-repl--source-owner watcher))
+        (when (buffer-live-p source)
+          (with-current-buffer source
+            (when fumos-repl--source-owner
+              (fumos-repl-unlink-current-buffer)))
+          (kill-buffer source))))))
+
+(ert-deftest fumos-ordinary-target-watcher-newer-owner-wins ()
+  (fumos-test-with-two-ready-connections
+      (first first-server second second-server)
+    (let* ((source (generate-new-buffer " *fumos-target-watcher-source*"))
+           (ordinary (generate-new-buffer " *fumos-target-watcher-repl*"))
+           (capf (lambda () nil))
+           (xref (lambda () nil))
+           (eldoc (lambda (&rest _) nil))
+           watcher watcher-ran ordinary-editing)
+      (unwind-protect
+          (progn
+            (with-current-buffer ordinary
+              (fennel-proto-repl-mode))
+            (with-current-buffer source
+              (fennel-mode)
+              (setq-local fennel-proto-repl-fennel-module-name
+                          "ordinary.target.module"
+                          completion-at-point-functions (list capf)
+                          xref-backend-functions (list xref)
+                          eldoc-documentation-functions (list eldoc))
+              (setq ordinary-editing (fumos-test-source-editing-state)))
+            (fumos-repl--link-buffer-to-connection first source)
+            (setq
+             watcher
+             (lambda (_symbol new-value operation where)
+               (when (and (eq operation 'set) (eq where source)
+                          (eq new-value ordinary) (not watcher-ran))
+                 (setq watcher-ran t)
+                 (remove-variable-watcher
+                  'fennel-proto-repl--buffer watcher)
+                 (fumos-repl--link-buffer-to-connection second source))))
+            (add-variable-watcher 'fennel-proto-repl--buffer watcher)
+            (with-current-buffer source
+              (fennel-proto-repl--link-buffer ordinary)
+              (should watcher-ran))
+            (fumos-test-assert-source-owned-by source second)
+            (should-not
+             (memq source (fumos-connection-linked-buffers first)))
+            (with-current-buffer source
+              (should (eq second (fumos-repl-unlink-current-buffer)))
+              (should-not fumos-repl--source-owner)
+              (should-not fennel-proto-repl--buffer)
+              (should-not fennel-proto-repl-minor-mode)
+              (should (equal "ordinary.target.module"
+                             fennel-proto-repl-fennel-module-name))
+              (should (equal ordinary-editing
+                             (fumos-test-source-editing-state))))
+            (should-not
+             (memq source (fumos-connection-linked-buffers second))))
+        (when watcher
+          (remove-variable-watcher 'fennel-proto-repl--buffer watcher))
+        (dolist (buffer (list source ordinary))
+          (when (buffer-live-p buffer)
+            (with-current-buffer buffer
+              (when fumos-repl--source-owner
+                (fumos-repl-unlink-current-buffer)))
+            (kill-buffer buffer)))))))
+
+(ert-deftest fumos-release-active-ordinary-refreshes-after-owner-commit ()
+  (fumos-test-with-ready-connection (connection server)
+    (let* ((source (generate-new-buffer " *fumos-active-ordinary-source*"))
+           (ordinary (generate-new-buffer " *fumos-active-ordinary-repl*"))
+           (dynamic-config '(global scoped-macro))
+           sync-observations)
+      (unwind-protect
+          (progn
+            (with-current-buffer ordinary
+              (fennel-proto-repl-mode))
+            (with-current-buffer source
+              (fennel-mode)
+              (font-lock-mode 1)
+              (setq-local font-lock-mode t
+                          fennel-proto-repl-font-lock-dynamically
+                          dynamic-config
+                          fennel-proto-repl--buffer ordinary)
+              (let ((fennel-proto-repl-project-integration nil))
+                (fennel-proto-repl-minor-mode 1))
+              (fennel-proto-repl--link-buffer ordinary))
+            (fumos-repl--link-buffer-to-connection connection source)
+            (cl-letf
+                (((symbol-function 'fennel-proto-repl-send-message-sync)
+                  (lambda (&rest args)
+                    (with-current-buffer source
+                      (push (list fumos-repl--source-owner
+                                  fennel-proto-repl--buffer args)
+                            sync-observations))
+                    (if (string-match-p "macro-loaded" (or (cadr args) ""))
+                        '("nil")
+                      '("[\"ordinary-global\"]"))))
+                 ((symbol-function 'accept-process-output)
+                  (lambda (&rest _)
+                    (ert-fail "stubbed ordinary refresh unexpectedly waited"))))
+              (with-current-buffer source
+                (should (eq connection
+                            (fumos-repl-unlink-current-buffer)))))
+            (should sync-observations)
+            (dolist (observation sync-observations)
+              (should-not (nth 0 observation))
+              (should (eq ordinary (nth 1 observation))))
+            (with-current-buffer source
+              (should-not fumos-repl--source-owner)
+              (should fennel-proto-repl-minor-mode)
+              (should (eq ordinary fennel-proto-repl--buffer))
+              (should (eq dynamic-config
+                          fennel-proto-repl-font-lock-dynamically)))
+            (should-not
+             (memq source (fumos-connection-linked-buffers connection))))
+        (dolist (buffer (list source ordinary))
+          (when (buffer-live-p buffer)
+            (with-current-buffer buffer
+              (when fumos-repl--source-owner
+                (fumos-repl-unlink-current-buffer))
+              (set-buffer-modified-p nil))
+            (kill-buffer buffer)))))))
+
 (ert-deftest fumos-killing-source-buffer-immediately-releases-link-ownership ()
   (fumos-test-with-source-before-and-after-attach
       (before after connection server)
@@ -2243,12 +3201,19 @@
               (should fennel-proto-repl-minor-mode)
               (should (memq #'fennel--xref-backend
                             xref-backend-functions))
-              (should-not
-               (memq #'fennel-proto-repl--xref-backend
-                     xref-backend-functions))
+              (should (memq #'fennel-proto-repl--xref-backend
+                            xref-backend-functions))
               (should-not
                (memq #'fumos-repl--xref-backend xref-backend-functions))
-              (should (memq #'ignore xref-backend-functions)))
+              (should (memq #'ignore xref-backend-functions))
+              (should (memq #'fennel-proto-repl-complete
+                            completion-at-point-functions))
+              (should
+               (memq #'fennel-proto-repl-eldoc-fn-docstring
+                     eldoc-documentation-functions))
+              (should
+               (memq #'fennel-proto-repl-eldoc-var-docstring
+                     eldoc-documentation-functions)))
             (should-not
              (memq clear-source
                    (fumos-connection-linked-buffers connection)))
@@ -2863,28 +3828,839 @@
       (dolist (buffer (list source a-repl b-repl c-repl))
         (when (buffer-live-p buffer) (kill-buffer buffer))))))
 
-(ert-deftest fumos-second-teardown-cleans-link-added-after-closing ()
-  (let* ((source (generate-new-buffer " *fumos-late-link-source*"))
-         (repl (generate-new-buffer " *fumos-late-link-repl*"))
-         (connection
-          (make-fumos-connection
-           :state 'ready :repl-buffer repl
-           :callback-deliveries (make-hash-table :test #'eql))))
-    (unwind-protect
-        (progn
-          (fumos-repl--teardown-transport connection "first teardown")
+(ert-deftest fumos-closing-teardown-rejects-reentrant-owner-transfer ()
+  (fumos-test-with-two-ready-connections
+      (first first-server second second-server)
+    (let* ((source-a (generate-new-buffer " *fumos-closing-source-a*"))
+           (source-b (generate-new-buffer " *fumos-closing-source-b*"))
+           (capf (lambda () nil))
+           (xref (lambda () nil))
+           (eldoc (lambda (&rest _) nil))
+           watcher watcher-ran attempted-result editing-a editing-b)
+      (unwind-protect
+          (progn
+            (dolist (entry `((,source-a . "ordinary.closing.a")
+                             (,source-b . "ordinary.closing.b")))
+              (with-current-buffer (car entry)
+                (fennel-mode)
+                (setq-local fennel-proto-repl-fennel-module-name (cdr entry)
+                            completion-at-point-functions (list capf)
+                            xref-backend-functions (list xref)
+                            eldoc-documentation-functions (list eldoc))))
+            (with-current-buffer source-a
+              (setq editing-a (fumos-test-source-editing-state)))
+            (with-current-buffer source-b
+              (setq editing-b (fumos-test-source-editing-state)))
+            (fumos-repl--link-buffer-to-connection first source-a)
+            (fumos-repl--link-buffer-to-connection second source-b)
+            (setq
+             watcher
+             (lambda (_symbol new-value operation where)
+               (when (and (eq operation 'set) (eq where source-a)
+                          (null new-value) (not watcher-ran))
+                 (setq watcher-ran t)
+                 (remove-variable-watcher
+                  'fumos-repl--source-owner watcher)
+                 (setq attempted-result
+                       (fumos-repl--link-buffer-to-connection
+                        first source-b)))))
+            (add-variable-watcher 'fumos-repl--source-owner watcher)
+            (fumos-repl--teardown-transport first "test closing barrier")
+            (should watcher-ran)
+            (should-not attempted-result)
+            (with-current-buffer source-a
+              (should-not fumos-repl--source-owner)
+              (should-not fennel-proto-repl--buffer)
+              (should-not fennel-proto-repl-minor-mode)
+              (should (equal "ordinary.closing.a"
+                             fennel-proto-repl-fennel-module-name))
+              (should (equal editing-a
+                             (fumos-test-source-editing-state))))
+            (fumos-test-assert-source-owned-by source-b second)
+            (should-not (fumos-connection-linked-buffers first))
+            (with-current-buffer source-b
+              (should (eq second (fumos-repl-unlink-current-buffer)))
+              (should-not fumos-repl--source-owner)
+              (should-not fennel-proto-repl--buffer)
+              (should-not fennel-proto-repl-minor-mode)
+              (should (equal "ordinary.closing.b"
+                             fennel-proto-repl-fennel-module-name))
+              (should (equal editing-b
+                             (fumos-test-source-editing-state))))
+            (should-not (fumos-connection-linked-buffers second)))
+        (when watcher
+          (remove-variable-watcher 'fumos-repl--source-owner watcher))
+        (dolist (buffer (list source-a source-b))
+          (when (buffer-live-p buffer)
+            (with-current-buffer buffer
+              (when fumos-repl--source-owner
+                (fumos-repl-unlink-current-buffer)))
+            (kill-buffer buffer)))))))
+
+(ert-deftest fumos-kill-cleanup-rejects-later-hook-owner-transfer ()
+  (fumos-test-with-two-ready-connections
+      (first first-server second second-server)
+    (let* ((source (generate-new-buffer " *fumos-kill-barrier-source*"))
+           (capf (lambda () nil))
+           (xref (lambda () nil))
+           (eldoc (lambda (&rest _) nil))
+           ordinary-editing observation)
+      (unwind-protect
+          (progn
+            (with-current-buffer source
+              (fennel-mode)
+              (setq-local fennel-proto-repl-fennel-module-name
+                          "ordinary.kill.module"
+                          completion-at-point-functions (list capf)
+                          xref-backend-functions (list xref)
+                          eldoc-documentation-functions (list eldoc))
+              (setq ordinary-editing (fumos-test-source-editing-state)))
+            (fumos-repl--link-buffer-to-connection first source)
+            (with-current-buffer source
+              (add-hook
+               'kill-buffer-hook
+               (lambda ()
+                 (setq observation
+                       (list
+                        (fumos-repl--link-buffer-to-connection second source)
+                        fumos-repl--source-owner
+                        fennel-proto-repl--buffer
+                        fennel-proto-repl-minor-mode
+                        (local-variable-p
+                         'fennel-proto-repl-fennel-module-name)
+                        fennel-proto-repl-fennel-module-name
+                        (fumos-test-source-editing-state))))
+               t t)
+              (kill-buffer source))
+            (should observation)
+            (should-not (nth 0 observation))
+            (should-not (nth 1 observation))
+            (should-not (nth 2 observation))
+            (should-not (nth 3 observation))
+            (should (nth 4 observation))
+            (should (equal "ordinary.kill.module" (nth 5 observation)))
+            (should (equal ordinary-editing (nth 6 observation)))
+            (should-not (buffer-live-p source))
+            (should-not
+             (memq source (fumos-connection-linked-buffers first)))
+            (should-not
+             (memq source (fumos-connection-linked-buffers second))))
+        (when (buffer-live-p source)
           (with-current-buffer source
-            (fennel-mode)
-            (fumos-repl--link-buffer-to-connection connection source)
-            (should (eq connection fumos-repl--source-owner)))
-          (fumos-repl--teardown-transport connection "second teardown")
+            (set-buffer-modified-p nil))
+          (kill-buffer source))))))
+
+(ert-deftest fumos-source-operation-setup-watcher-errors-roll-back-atomically ()
+  (fumos-test-with-two-ready-connections
+      (first first-server second second-server)
+    (let ((fumos-repl--source-operations
+           (make-hash-table :test #'eq :weakness 'key)))
+      (dolist (kind '(transition module))
+        (let* ((source
+                (generate-new-buffer
+                 (format " *fumos-setup-%s-source*" kind)))
+               (ordinary
+                (generate-new-buffer
+                 (format " *fumos-setup-%s-ordinary*" kind)))
+               (module (format "ordinary.setup.%s" kind))
+               (capf (lambda () nil))
+               (xref (lambda () nil))
+               (eldoc (lambda (&rest _) nil))
+               editing watcher)
+          (unwind-protect
+              (progn
+                (setq editing
+                      (fumos-test-prepare-ordinary-source
+                       source ordinary module capf xref eldoc))
+                (setq
+                 watcher
+                 (lambda (_symbol new-value operation where)
+                   (when
+                       (and (eq operation 'set) (eq where source)
+                            (pcase kind
+                              ('transition
+                               (and
+                                (eq (car-safe new-value) 'fumos-source-link)
+                                (eq (nth 1 new-value) first)))
+                              ('module
+                               (equal new-value
+                                      fumos-repl-fennel-module-name))))
+                     (remove-variable-watcher
+                      (if (eq kind 'transition)
+                          'fumos-repl--source-link-transition
+                        'fennel-proto-repl-fennel-module-name)
+                      watcher)
+                     (error "Injected %s setup watcher failure" kind))))
+                (add-variable-watcher
+                 (if (eq kind 'transition)
+                     'fumos-repl--source-link-transition
+                   'fennel-proto-repl-fennel-module-name)
+                 watcher)
+                (should-error
+                 (fumos-repl--link-buffer-to-connection first source)
+                 :type 'error)
+                (remove-variable-watcher
+                 (if (eq kind 'transition)
+                     'fumos-repl--source-link-transition
+                   'fennel-proto-repl-fennel-module-name)
+                 watcher)
+                (should-not (gethash source fumos-repl--source-operations))
+                (fumos-test-assert-source-ordinary
+                 source ordinary module editing (list first second))
+                (should
+                 (eq second
+                     (fumos-repl--link-buffer-to-connection second source)))
+                (fumos-test-assert-source-owned-by source second)
+                (should-not
+                 (memq source (fumos-connection-linked-buffers first)))
+                (with-current-buffer source
+                  (should (eq second (fumos-repl-unlink-current-buffer))))
+                (fumos-test-assert-source-ordinary
+                 source ordinary module editing (list first second)))
+            (when watcher
+              (remove-variable-watcher
+               (if (eq kind 'transition)
+                   'fumos-repl--source-link-transition
+                 'fennel-proto-repl-fennel-module-name)
+               watcher))
+            (dolist (buffer (list source ordinary))
+              (when (buffer-live-p buffer)
+                (with-current-buffer buffer
+                  (setq kill-buffer-hook nil)
+                  (set-buffer-modified-p nil))
+                (kill-buffer buffer)))))))))
+
+(ert-deftest fumos-source-operation-failure-rollback-keeps-newer-owner ()
+  (fumos-test-with-two-ready-connections
+      (first first-server second second-server)
+    (let* ((fumos-repl--source-operations
+            (make-hash-table :test #'eq :weakness 'key))
+           (source (generate-new-buffer " *fumos-rollback-owner-source*"))
+           (ordinary (generate-new-buffer " *fumos-rollback-owner-ordinary*"))
+           (module "ordinary.rollback.owner")
+           (capf (lambda () nil))
+           (xref (lambda () nil))
+           (eldoc (lambda (&rest _) nil))
+           (original-install
+            (symbol-function 'fumos-repl--install-owned-editing-state))
+           editing watcher watcher-ran)
+      (unwind-protect
+          (progn
+            (setq editing
+                  (fumos-test-prepare-ordinary-source
+                   source ordinary module capf xref eldoc))
+            (setq
+             watcher
+             (lambda (_symbol new-value operation where)
+               (when (and (eq operation 'set) (eq where source)
+                          (null new-value) (not watcher-ran))
+                 (setq watcher-ran t)
+                 (remove-variable-watcher
+                  'fumos-repl--source-owner watcher)
+                 (fumos-repl--link-buffer-to-connection second source))))
+            (add-variable-watcher 'fumos-repl--source-owner watcher)
+            (cl-letf
+                (((symbol-function 'fumos-repl--install-owned-editing-state)
+                  (lambda ()
+                    (funcall original-install)
+                    (when (eq fumos-repl--internal-link-target
+                              (fumos-connection-repl-buffer first))
+                      (error "Injected outer link setup failure")))))
+              (should-error
+               (fumos-repl--link-buffer-to-connection first source)
+               :type 'error))
+            (should watcher-ran)
+            (fumos-test-assert-source-owned-by source second)
+            (should-not
+             (memq source (fumos-connection-linked-buffers first)))
+            (with-current-buffer source
+              (should (eq second (fumos-repl-unlink-current-buffer))))
+            (fumos-test-assert-source-ordinary
+             source ordinary module editing (list first second)))
+        (when watcher
+          (remove-variable-watcher 'fumos-repl--source-owner watcher))
+        (dolist (buffer (list source ordinary))
+          (when (buffer-live-p buffer)
+            (with-current-buffer buffer
+              (setq kill-buffer-hook nil)
+              (set-buffer-modified-p nil))
+            (kill-buffer buffer)))))))
+
+(ert-deftest fumos-source-operation-ordinary-watcher-replays-without-relink ()
+  (fumos-test-with-two-ready-connections
+      (first first-server second second-server)
+    (let* ((fumos-repl--source-operations
+            (make-hash-table :test #'eq :weakness 'key))
+           (source (generate-new-buffer " *fumos-ordinary-watcher-source*"))
+           (ordinary
+            (generate-new-buffer " *fumos-ordinary-watcher-original*"))
+           (superseded
+            (generate-new-buffer " *fumos-ordinary-watcher-superseded*"))
+           (module "ordinary.target.watcher")
+           (capf (lambda () nil))
+           (xref (lambda () nil))
+           (eldoc (lambda (&rest _) nil))
+           (original-link
+            (symbol-function 'fennel-proto-repl--link-buffer))
+           editing watcher watcher-ran (upstream-calls 0))
+      (unwind-protect
+          (progn
+            (setq editing
+                  (fumos-test-prepare-ordinary-source
+                   source ordinary module capf xref eldoc))
+            (with-current-buffer superseded
+              (fennel-proto-repl-mode))
+            (fumos-repl--link-buffer-to-connection first source)
+            (setq
+             watcher
+             (lambda (_symbol new-value operation where)
+               (when (and (eq operation 'set) (eq where source)
+                          (eq new-value superseded) (not watcher-ran))
+                 (setq watcher-ran t)
+                 (remove-variable-watcher
+                  'fennel-proto-repl--buffer watcher)
+                 (fumos-repl--link-buffer-to-connection second source))))
+            (add-variable-watcher 'fennel-proto-repl--buffer watcher)
+            (cl-letf
+                (((symbol-function 'fennel-proto-repl--link-buffer)
+                  (lambda (&optional target)
+                    (cl-incf upstream-calls)
+                    (funcall original-link target))))
+              (with-current-buffer source
+                (fennel-proto-repl--link-buffer superseded)))
+            (should watcher-ran)
+            ;; One explicit ordinary link plus B's initial upstream setup.  A
+            ;; third call would mean post-advice repaired B by relinking it.
+            (should (= 2 upstream-calls))
+            (fumos-test-assert-source-owned-by source second)
+            (should-not
+             (memq source (fumos-connection-linked-buffers first)))
+            (with-current-buffer source
+              (should (eq second (fumos-repl-unlink-current-buffer))))
+            (fumos-test-assert-source-ordinary
+             source ordinary module editing (list first second)))
+        (when watcher
+          (remove-variable-watcher 'fennel-proto-repl--buffer watcher))
+        (dolist (buffer (list source ordinary superseded))
+          (when (buffer-live-p buffer)
+            (with-current-buffer buffer
+              (setq kill-buffer-hook nil)
+              (set-buffer-modified-p nil))
+            (kill-buffer buffer)))))))
+
+(ert-deftest fumos-source-operation-release-watcher-replays-without-relink ()
+  (fumos-test-with-two-ready-connections
+      (first first-server second second-server)
+    (let* ((fumos-repl--source-operations
+            (make-hash-table :test #'eq :weakness 'key))
+           (source (generate-new-buffer " *fumos-release-watcher-source*"))
+           (ordinary
+            (generate-new-buffer " *fumos-release-watcher-ordinary*"))
+           (module "ordinary.release.watcher")
+           (capf (lambda () nil))
+           (xref (lambda () nil))
+           (eldoc (lambda (&rest _) nil))
+           (original-link
+            (symbol-function 'fennel-proto-repl--link-buffer))
+           editing watcher watcher-ran release-result (upstream-calls 0))
+      (unwind-protect
+          (progn
+            (setq editing
+                  (fumos-test-prepare-ordinary-source
+                   source ordinary module capf xref eldoc))
+            (fumos-repl--link-buffer-to-connection first source)
+            (setq
+             watcher
+             (lambda (_symbol new-value operation where)
+               (when (and (eq operation 'set) (eq where source)
+                          (eq new-value ordinary) (not watcher-ran))
+                 (setq watcher-ran t)
+                 (remove-variable-watcher
+                  'fennel-proto-repl--buffer watcher)
+                 (fumos-repl--link-buffer-to-connection second source))))
+            (add-variable-watcher 'fennel-proto-repl--buffer watcher)
+            (cl-letf
+                (((symbol-function 'fennel-proto-repl--link-buffer)
+                  (lambda (&optional target)
+                    (cl-incf upstream-calls)
+                    (funcall original-link target))))
+              (with-current-buffer source
+                (setq release-result (fumos-repl-unlink-current-buffer))))
+            (should watcher-ran)
+            (should (eq first release-result))
+            ;; Only B's first upstream setup is necessary.  Release recovery is
+            ;; a direct hash replay and must not call upstream a second time.
+            (should (= 1 upstream-calls))
+            (fumos-test-assert-source-owned-by source second)
+            (should-not
+             (memq source (fumos-connection-linked-buffers first)))
+            (with-current-buffer source
+              (should (eq second (fumos-repl-unlink-current-buffer))))
+            (fumos-test-assert-source-ordinary
+             source ordinary module editing (list first second)))
+        (when watcher
+          (remove-variable-watcher 'fennel-proto-repl--buffer watcher))
+        (dolist (buffer (list source ordinary))
+          (when (buffer-live-p buffer)
+            (with-current-buffer buffer
+              (setq kill-buffer-hook nil)
+              (set-buffer-modified-p nil))
+            (kill-buffer buffer)))))))
+
+(ert-deftest fumos-source-operation-replay-watcher-publishes-ordinary-release ()
+  (fumos-test-with-two-ready-connections
+      (first first-server second second-server)
+    (let* ((fumos-repl--source-operations
+            (make-hash-table :test #'eq :weakness 'key))
+           (source (generate-new-buffer " *fumos-replay-release-source*"))
+           (ordinary
+            (generate-new-buffer " *fumos-replay-release-original*"))
+           (ordinary-one
+            (generate-new-buffer " *fumos-replay-release-one*"))
+           (ordinary-two
+            (generate-new-buffer " *fumos-replay-release-two*"))
+           (module "ordinary.replay.release")
+           (capf (lambda () nil))
+           (xref (lambda () nil))
+           (eldoc (lambda (&rest _) nil))
+           (original-link
+            (symbol-function 'fennel-proto-repl--link-buffer))
+           editing target-watcher owner-watcher b-linked owner-watcher-ran
+           (upstream-calls 0))
+      (unwind-protect
+          (progn
+            (setq editing
+                  (fumos-test-prepare-ordinary-source
+                   source ordinary module capf xref eldoc))
+            (dolist (buffer (list ordinary-one ordinary-two))
+              (with-current-buffer buffer
+                (fennel-proto-repl-mode)))
+            (fumos-repl--link-buffer-to-connection first source)
+            (setq
+             owner-watcher
+             (lambda (_symbol new-value operation where)
+               (when (and (eq operation 'set) (eq where source) b-linked
+                          (eq new-value second) (not owner-watcher-ran))
+                 (setq owner-watcher-ran t)
+                 (remove-variable-watcher
+                  'fumos-repl--source-owner owner-watcher)
+                 (with-current-buffer source
+                   (fennel-proto-repl--link-buffer ordinary-two))))
+             target-watcher
+             (lambda (_symbol new-value operation where)
+               (when (and (eq operation 'set) (eq where source)
+                          (eq new-value ordinary-one))
+                 (remove-variable-watcher
+                  'fennel-proto-repl--buffer target-watcher)
+                 (fumos-repl--link-buffer-to-connection second source)
+                 (setq b-linked t))))
+            (add-variable-watcher 'fumos-repl--source-owner owner-watcher)
+            (add-variable-watcher 'fennel-proto-repl--buffer target-watcher)
+            (cl-letf
+                (((symbol-function 'fennel-proto-repl--link-buffer)
+                  (lambda (&optional target)
+                    (cl-incf upstream-calls)
+                    (funcall original-link target))))
+              (with-current-buffer source
+                (fennel-proto-repl--link-buffer ordinary-one)))
+            (should b-linked)
+            (should owner-watcher-ran)
+            (should (= 3 upstream-calls))
+            (fumos-test-assert-source-ordinary
+             source ordinary-two module editing (list first second))
+            (with-current-buffer source
+              (should
+               (eq 'fumos-source-release
+                   (car-safe
+                    (gethash source fumos-repl--source-operations))))
+              (should-not (fumos-repl-unlink-current-buffer)))
+            (fumos-test-assert-source-ordinary
+             source ordinary-two module editing (list first second)))
+        (when target-watcher
+          (remove-variable-watcher
+           'fennel-proto-repl--buffer target-watcher))
+        (when owner-watcher
+          (remove-variable-watcher 'fumos-repl--source-owner owner-watcher))
+        (dolist (buffer (list source ordinary ordinary-one ordinary-two))
+          (when (buffer-live-p buffer)
+            (with-current-buffer buffer
+              (setq kill-buffer-hook nil)
+              (set-buffer-modified-p nil))
+            (kill-buffer buffer)))))))
+
+(ert-deftest fumos-source-operation-pending-owner-watcher-cancels-link ()
+  (fumos-test-with-two-ready-connections
+      (first first-server second second-server)
+    (let* ((fumos-repl--source-operations
+            (make-hash-table :test #'eq :weakness 'key))
+           (source (generate-new-buffer " *fumos-pending-owner-source*"))
+           (ordinary
+            (generate-new-buffer " *fumos-pending-owner-original*"))
+           (ordinary-two
+            (generate-new-buffer " *fumos-pending-owner-two*"))
+           (module "ordinary.pending.owner")
+           (capf (lambda () nil))
+           (xref (lambda () nil))
+           (eldoc (lambda (&rest _) nil))
+           (original-link
+            (symbol-function 'fennel-proto-repl--link-buffer))
+           editing watcher watcher-ran result (upstream-calls 0))
+      (unwind-protect
+          (progn
+            (setq editing
+                  (fumos-test-prepare-ordinary-source
+                   source ordinary module capf xref eldoc))
+            (with-current-buffer ordinary-two
+              (fennel-proto-repl-mode))
+            (setq
+             watcher
+             (lambda (_symbol new-value operation where)
+               (when (and (eq operation 'set) (eq where source)
+                          (eq new-value first) (not watcher-ran))
+                 (setq watcher-ran t)
+                 (remove-variable-watcher
+                  'fumos-repl--source-owner watcher)
+                 (with-current-buffer source
+                   (fennel-proto-repl--link-buffer ordinary-two)))))
+            (add-variable-watcher 'fumos-repl--source-owner watcher)
+            (cl-letf
+                (((symbol-function 'fennel-proto-repl--link-buffer)
+                  (lambda (&optional target)
+                    (cl-incf upstream-calls)
+                    (funcall original-link target))))
+              (setq result
+                    (fumos-repl--link-buffer-to-connection first source)))
+            (should watcher-ran)
+            (should-not result)
+            (should (= 2 upstream-calls))
+            (fumos-test-assert-source-ordinary
+             source ordinary-two module editing (list first second))
+            (with-current-buffer source
+              (should
+               (eq 'fumos-source-release
+                   (car-safe
+                    (gethash source fumos-repl--source-operations))))
+              (should-not (fumos-repl-unlink-current-buffer))))
+        (when watcher
+          (remove-variable-watcher 'fumos-repl--source-owner watcher))
+        (dolist (buffer (list source ordinary ordinary-two))
+          (when (buffer-live-p buffer)
+            (with-current-buffer buffer
+              (setq kill-buffer-hook nil)
+              (set-buffer-modified-p nil))
+            (kill-buffer buffer)))))))
+
+(ert-deftest fumos-source-operation-aborted-kill-can-relink ()
+  (fumos-test-with-two-ready-connections
+      (first first-server second second-server)
+    (let* ((fumos-repl--source-operations
+            (make-hash-table :test #'eq :weakness 'key))
+           (source (generate-new-buffer " *fumos-aborted-kill-source*"))
+           (ordinary (generate-new-buffer " *fumos-aborted-kill-ordinary*"))
+           (module "ordinary.aborted.kill")
+           (capf (lambda () nil))
+           (xref (lambda () nil))
+           (eldoc (lambda (&rest _) nil))
+           (later-hook (lambda () (error "Injected later kill hook failure")))
+           editing outcome)
+      (unwind-protect
+          (progn
+            (setq editing
+                  (fumos-test-prepare-ordinary-source
+                   source ordinary module capf xref eldoc))
+            (fumos-repl--link-buffer-to-connection first source)
+            (with-current-buffer source
+              (add-hook 'kill-buffer-hook later-hook t t))
+            (setq outcome
+                  (condition-case caught
+                      (progn (kill-buffer source) :returned)
+                    (error (cons 'error caught))))
+            (should (eq 'error (car-safe outcome)))
+            (should (buffer-live-p source))
+            (with-current-buffer source
+              (should-not fumos-repl--source-killing)
+              (remove-hook 'kill-buffer-hook later-hook t))
+            (fumos-test-assert-source-ordinary
+             source ordinary module editing (list first second))
+            (should
+             (eq second
+                 (fumos-repl--link-buffer-to-connection second source)))
+            (fumos-test-assert-source-owned-by source second)
+            (should-not
+             (memq source (fumos-connection-linked-buffers first)))
+            (with-current-buffer source
+              (should (eq second (fumos-repl-unlink-current-buffer))))
+            (fumos-test-assert-source-ordinary
+             source ordinary module editing (list first second)))
+        (when (buffer-live-p source)
           (with-current-buffer source
-            (should-not fumos-repl--source-owner)
-            (should-not fennel-proto-repl--buffer)
-            (should-not fennel-proto-repl-minor-mode))
-          (should-not (fumos-connection-linked-buffers connection)))
-      (dolist (buffer (list source repl))
-        (when (buffer-live-p buffer) (kill-buffer buffer))))))
+            (remove-hook 'kill-buffer-hook later-hook t)
+            (setq kill-buffer-hook nil)
+            (set-buffer-modified-p nil))
+          (kill-buffer source))
+        (when (buffer-live-p ordinary)
+          (kill-buffer ordinary))))))
+
+(ert-deftest fumos-source-operation-does-not-pollute-hook-variables ()
+  (fumos-test-with-two-ready-connections
+      (first first-server second second-server)
+    (let* ((fumos-repl--source-operations
+            (make-hash-table :test #'eq :weakness 'key))
+           (source (generate-new-buffer " *fumos-hook-state-source*"))
+           (ordinary (generate-new-buffer " *fumos-hook-state-ordinary*"))
+           (module "ordinary.hook.state")
+           (capf (lambda () nil))
+           (xref (lambda () nil))
+           (eldoc (lambda (&rest _) nil))
+           (local-kill-hook (lambda () nil))
+           (local-mode-hook (lambda () nil))
+           (default-kill-hooks (copy-tree (default-value 'kill-buffer-hook)))
+           (default-mode-hooks
+            (copy-tree
+             (default-value 'fennel-proto-repl-minor-mode-hook)))
+           local-kill-hooks local-mode-hooks editing)
+      (cl-labels
+          ((assert-hooks-unchanged
+            ()
+            (should (equal default-kill-hooks
+                           (default-value 'kill-buffer-hook)))
+            (should (equal default-mode-hooks
+                           (default-value
+                            'fennel-proto-repl-minor-mode-hook)))
+            (with-current-buffer source
+              (should (local-variable-p 'kill-buffer-hook))
+              (should
+               (local-variable-p 'fennel-proto-repl-minor-mode-hook))
+              (should (equal local-kill-hooks kill-buffer-hook))
+              (should
+               (equal local-mode-hooks fennel-proto-repl-minor-mode-hook))
+              (dolist (hook (list kill-buffer-hook
+                                  fennel-proto-repl-minor-mode-hook))
+                (should-not
+                 (memq #'fumos-repl--source-kill-cleanup hook))
+                (should-not
+                 (memq #'fumos-repl--source-upstream-mode-change hook))))))
+        (unwind-protect
+            (progn
+              (setq editing
+                    (fumos-test-prepare-ordinary-source
+                     source ordinary module capf xref eldoc))
+              (with-current-buffer source
+                (setq-local kill-buffer-hook (list local-kill-hook)
+                            fennel-proto-repl-minor-mode-hook
+                            (list local-mode-hook))
+                (setq local-kill-hooks (copy-sequence kill-buffer-hook)
+                      local-mode-hooks
+                      (copy-sequence fennel-proto-repl-minor-mode-hook)))
+              (assert-hooks-unchanged)
+              (fumos-repl--link-buffer-to-connection first source)
+              (fumos-test-assert-source-owned-by source first)
+              (assert-hooks-unchanged)
+              (fumos-repl--link-buffer-to-connection second source)
+              (fumos-test-assert-source-owned-by source second)
+              (should-not
+               (memq source (fumos-connection-linked-buffers first)))
+              (assert-hooks-unchanged)
+              (with-current-buffer source
+                (should (eq second (fumos-repl-unlink-current-buffer))))
+              (fumos-test-assert-source-ordinary
+               source ordinary module editing (list first second))
+              (assert-hooks-unchanged))
+          (when (buffer-live-p source)
+            (with-current-buffer source
+              (setq kill-buffer-hook nil)
+              (set-buffer-modified-p nil))
+            (kill-buffer source))
+          (when (buffer-live-p ordinary)
+            (kill-buffer ordinary)))))))
+
+(ert-deftest fumos-source-operation-release-module-watcher-exits-are-coherent ()
+  (fumos-test-with-two-ready-connections
+      (first first-server second second-server)
+    (let ((fumos-repl--source-operations
+           (make-hash-table :test #'eq :weakness 'key)))
+      (dolist (kind '(error quit))
+        (let* ((source
+                (generate-new-buffer
+                 (format " *fumos-release-module-%s-source*" kind)))
+               (ordinary
+                (generate-new-buffer
+                 (format " *fumos-release-module-%s-ordinary*" kind)))
+               (module (format "ordinary.release.module.%s" kind))
+               (capf (lambda () nil))
+               (xref (lambda () nil))
+               (eldoc (lambda (&rest _) nil))
+               editing watcher watcher-ran outcome)
+          (unwind-protect
+              (progn
+                (setq editing
+                      (fumos-test-prepare-ordinary-source
+                       source ordinary module capf xref eldoc))
+                (fumos-repl--link-buffer-to-connection first source)
+                (setq
+                 watcher
+                 (lambda (_symbol new-value operation where)
+                   (when (and (eq operation 'set) (eq where source)
+                              (equal new-value module) (not watcher-ran))
+                     (setq watcher-ran t)
+                     (remove-variable-watcher
+                      'fennel-proto-repl-fennel-module-name watcher)
+                     (signal kind (list "Injected module restoration exit")))))
+                (add-variable-watcher
+                 'fennel-proto-repl-fennel-module-name watcher)
+                (with-current-buffer source
+                  (setq outcome
+                        (condition-case caught
+                            (progn
+                              (fumos-repl-unlink-current-buffer)
+                              '(:returned))
+                          (error caught)
+                          (quit caught))))
+                (should watcher-ran)
+                (should (eq kind (car-safe outcome)))
+                (with-current-buffer source
+                  (if fumos-repl--source-owner
+                      (progn
+                        (should (eq first fumos-repl--source-owner))
+                        (fumos-test-assert-source-owned-by source first)
+                        (should-not
+                         (memq source
+                               (fumos-connection-linked-buffers second)))
+                        (should
+                         (eq first (fumos-repl-unlink-current-buffer))))
+                    (fumos-test-assert-source-ordinary
+                     source ordinary module editing (list first second))))
+                (fumos-test-assert-source-ordinary
+                 source ordinary module editing (list first second)))
+            (when watcher
+              (remove-variable-watcher
+               'fennel-proto-repl-fennel-module-name watcher))
+            (dolist (buffer (list source ordinary))
+              (when (buffer-live-p buffer)
+                (with-current-buffer buffer
+                  (setq kill-buffer-hook nil)
+                  (set-buffer-modified-p nil))
+                (kill-buffer buffer)))))))))
+
+(ert-deftest fumos-source-operation-mode-hook-exits-still-release-owner ()
+  (fumos-test-with-two-ready-connections
+      (first first-server second second-server)
+    (let ((fumos-repl--source-operations
+           (make-hash-table :test #'eq :weakness 'key)))
+      (dolist (kind '(error quit))
+        (let* ((source
+                (generate-new-buffer
+                 (format " *fumos-mode-hook-%s-source*" kind)))
+               (ordinary
+                (generate-new-buffer
+                 (format " *fumos-mode-hook-%s-ordinary*" kind)))
+               (module (format "ordinary.mode.hook.%s" kind))
+               (capf (lambda () nil))
+               (xref (lambda () nil))
+               (eldoc (lambda (&rest _) nil))
+               editing hook hook-ran outcome)
+          (unwind-protect
+              (progn
+                (setq editing
+                      (fumos-test-prepare-ordinary-source
+                       source ordinary module capf xref eldoc))
+                (fumos-repl--link-buffer-to-connection first source)
+                (setq
+                 hook
+                 (lambda ()
+                   (when (and (not fennel-proto-repl-minor-mode)
+                              (not hook-ran))
+                     (setq hook-ran t)
+                     (remove-hook
+                      'fennel-proto-repl-minor-mode-hook hook t)
+                     (signal kind (list "Injected user mode hook exit")))))
+                (with-current-buffer source
+                  (add-hook 'fennel-proto-repl-minor-mode-hook hook t t)
+                  (setq outcome
+                        (condition-case caught
+                            (progn
+                              (fennel-proto-repl-minor-mode -1)
+                              '(:returned))
+                          (error caught)
+                          (quit caught))))
+                (should hook-ran)
+                (should (eq kind (car-safe outcome)))
+                (with-current-buffer source
+                  (should-not fumos-repl--source-owner)
+                  (should (eq ordinary fennel-proto-repl--buffer))
+                  (should-not fennel-proto-repl-minor-mode)
+                  (should
+                   (local-variable-p
+                    'fennel-proto-repl-fennel-module-name))
+                  (should
+                   (equal module fennel-proto-repl-fennel-module-name))
+                  (should
+                   (equal editing (fumos-test-source-editing-state)))
+                  (should-not (memq #'fumos-completion-at-point
+                                    completion-at-point-functions))
+                  (should-not (memq #'fumos-repl--xref-backend
+                                    xref-backend-functions))
+                  (should-not (memq #'fumos-eldoc-function
+                                    eldoc-documentation-functions)))
+                (dolist (connection (list first second))
+                  (should-not
+                   (memq source
+                         (fumos-connection-linked-buffers connection)))))
+            (when (and hook (buffer-live-p source))
+              (with-current-buffer source
+                (remove-hook 'fennel-proto-repl-minor-mode-hook hook t)))
+            (dolist (buffer (list source ordinary))
+              (when (buffer-live-p buffer)
+                (with-current-buffer buffer
+                  (setq kill-buffer-hook nil)
+                  (set-buffer-modified-p nil))
+                (kill-buffer buffer)))))))))
+
+(ert-deftest fumos-source-operation-kill-invalidation-exits-leave-no-ledger ()
+  (fumos-test-with-two-ready-connections
+      (first first-server second second-server)
+    (let ((fumos-repl--source-operations
+           (make-hash-table :test #'eq :weakness 'key)))
+      (dolist (kind '(error quit))
+        (let* ((source
+                (generate-new-buffer
+                 (format " *fumos-kill-invalidate-%s-source*" kind)))
+               (ordinary
+                (generate-new-buffer
+                 (format " *fumos-kill-invalidate-%s-ordinary*" kind)))
+               (capf (lambda () nil))
+               (xref (lambda () nil))
+               (eldoc (lambda (&rest _) nil))
+               outcome)
+          (unwind-protect
+              (progn
+                (fumos-test-prepare-ordinary-source
+                 source ordinary (format "ordinary.kill.invalidate.%s" kind)
+                 capf xref eldoc)
+                (fumos-repl--link-buffer-to-connection first source)
+                (cl-letf
+                    (((symbol-function 'fumos-eval--invalidate-source-tooling)
+                      (lambda (&rest _)
+                        (signal kind
+                                (list "Injected kill invalidation exit")))))
+                  (setq outcome
+                        (condition-case caught
+                            (kill-buffer source)
+                          (error caught)
+                          (quit caught))))
+                (should outcome)
+                (should-not (buffer-live-p source))
+                (dolist (connection (list first second))
+                  (should-not
+                   (memq source
+                         (fumos-connection-linked-buffers connection)))))
+            (when (buffer-live-p source)
+              (with-current-buffer source
+                (setq kill-buffer-hook nil)
+                (set-buffer-modified-p nil))
+              (kill-buffer source))
+            (when (buffer-live-p ordinary)
+              (kill-buffer ordinary))))))))
 
 (ert-deftest fumos-retry-scheduler-failures-are-contained ()
   (dolist (kind '(error quit non-timer))

@@ -485,13 +485,60 @@ Otherwise PATH is an untrusted wire path."
        :generation (fumos-connection-generation connection)
        :column-unit 'utf8-byte)))))
 
+(defvar fumos-eval--error-current-p nil
+  "Optional dynamic predicate which further owns the current error UI.")
+
 (defun fumos-eval--error-context-current-p (context)
   "Return non-nil while CONTEXT still owns its exact transport generation."
-  (and (fumos-request-context-p context)
-       (fumos-repl--owns-transport-p
-        (fumos-request-context-connection context)
-        (fumos-request-context-process context)
-        (fumos-request-context-generation context))))
+  (let ((marker (and (fumos-request-context-p context)
+                     (fumos-request-context-marker context))))
+    (and (fumos-request-context-p context)
+         (or (null marker)
+             (and (markerp marker)
+                  (marker-buffer marker)
+                  (marker-position marker)))
+         (fumos-repl--owns-transport-p
+          (fumos-request-context-connection context)
+          (fumos-request-context-process context)
+          (fumos-request-context-generation context))
+         (or (not (functionp fumos-eval--error-current-p))
+             (condition-case nil
+                 (funcall fumos-eval--error-current-p)
+               ((error quit) nil))))))
+
+(defun fumos-eval--error-operation-current-p (context epoch)
+  "Return non-nil while EPOCH still owns error UI for CONTEXT."
+  (and (fumos-eval--error-context-current-p context)
+       (eql epoch
+            (fumos-connection-error-epoch
+             (fumos-request-context-connection context)))))
+
+(defun fumos-eval--owned-error-buffer-p (buffer connection generation)
+  "Return non-nil when BUFFER has CONNECTION's complete local ownership."
+  (and (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (and (eq major-mode 'fumos-compilation-mode)
+              (local-variable-p 'fumos-compilation--owner)
+              (eq fumos-compilation--owner connection)
+              (local-variable-p 'fumos-compilation--generation)
+              (eql fumos-compilation--generation generation)))))
+
+(defun fumos-eval--error-staging-current-p
+    (buffer context epoch root records tokens)
+  "Validate BUFFER and every local identity owned by error EPOCH."
+  (and (fumos-eval--error-operation-current-p context epoch)
+       (fumos-eval--owned-error-buffer-p
+        buffer (fumos-request-context-connection context)
+        (fumos-request-context-generation context))
+       (with-current-buffer buffer
+         (and (local-variable-p 'fumos-compilation--root)
+              (equal fumos-compilation--root root)
+              (local-variable-p 'fumos-compilation--records)
+              (eq fumos-compilation--records records)
+              (hash-table-p fumos-compilation--records)
+              (local-variable-p 'fumos-compilation--tokens)
+              (eq fumos-compilation--tokens tokens)
+              (hash-table-p fumos-compilation--tokens)))))
 
 (defun fumos-eval--strip-known-error-prefix (line)
   "Strip only FUMOS-known diagnostic prefixes from raw LINE."
@@ -536,8 +583,7 @@ Otherwise PATH is an untrusted wire path."
          (connection (and context
                           (fumos-request-context-connection context))))
     (when (and connection (fumos-eval--error-context-current-p context))
-      (let* ((buffer
-              (get-buffer-create (fumos-eval--error-buffer-name connection)))
+      (let* ((epoch (1+ (or (fumos-connection-error-epoch connection) 0)))
              (unit (or (fumos-request-context-column-unit context)
                        'utf8-byte))
              (raw-lines
@@ -548,43 +594,154 @@ Otherwise PATH is an untrusted wire path."
                            (split-string (if (stringp traceback) traceback
                                            (format "%s" traceback))
                                          "\n" nil))))
-             records)
+             records previous previous-owned staging staging-root
+             staging-records staging-tokens committed)
+        (setf (fumos-connection-error-epoch connection) epoch)
         (dolist (raw raw-lines)
           (when-let* ((record
                        (fumos-eval--raw-line-locus
                         connection raw unit context)))
             (push record records)))
-        (with-current-buffer buffer
-          (fumos-compilation-mode)
-          (setq-local fumos-compilation--owner connection
-                      fumos-compilation--generation
-                      (fumos-request-context-generation context)
-                      fumos-compilation--root
-                      (and (car records)
-                           (fumos-source-authority-root
-                            (fumos-locus-record-authority (car records)))))
-          (let ((inhibit-read-only t)
-                (id 0))
-            (erase-buffer)
-            (insert (format "%s error:\n" (capitalize (format "%s" type))))
-            (dolist (raw raw-lines)
-              (insert "FUMOS-RAW " raw "\n"))
-            (dolist (record (nreverse records))
-              (let ((key (number-to-string (cl-incf id))))
-                (puthash key record fumos-compilation--records)
-                (insert
-                 (format "FUMOS-LOC %s: %s:%d:%d\n"
-                         key
-                         (fumos-source-authority-virtual
-                          (fumos-locus-record-authority record))
-                         (fumos-locus-record-line record)
-                         (1+ (fumos-locus-record-column record))))))
-            (goto-char (point-min))))
-        (setf (fumos-connection-error-buffer connection) buffer)
-        (pcase fennel-proto-repl-error-buffer-action
-          ('jump (pop-to-buffer buffer))
-          ('show (display-buffer buffer)))
-        buffer))))
+        ;; Build in a private buffer because mode hooks and variable watchers
+        ;; may recursively deliver a newer error in the same generation.
+        (when (fumos-eval--error-operation-current-p context epoch)
+          (setq
+           previous (fumos-connection-error-buffer connection)
+           previous-owned
+           (and (buffer-live-p previous)
+                (with-current-buffer previous
+                  (and (eq fumos-compilation--owner connection)
+                       (eql fumos-compilation--generation
+                            (fumos-request-context-generation context)))))
+           staging (generate-new-buffer " *FUMOS Error staging*"))
+          (unwind-protect
+              (progn
+                (with-current-buffer staging
+                  (fumos-compilation-mode))
+                (when (and (buffer-live-p staging)
+                           (fumos-eval--error-operation-current-p
+                            context epoch))
+                  (setq
+                   staging-root
+                   (and (car records)
+                        (fumos-source-authority-root
+                         (fumos-locus-record-authority (car records))))
+                   staging-records (make-hash-table :test #'equal)
+                   staging-tokens (make-hash-table :test #'equal))
+                  (with-current-buffer staging
+                    (setq-local
+                     fumos-compilation--owner connection
+                     fumos-compilation--generation
+                     (fumos-request-context-generation context)
+                     fumos-compilation--root staging-root
+                     fumos-compilation--records staging-records
+                     fumos-compilation--tokens staging-tokens)
+                    (let ((inhibit-read-only t)
+                          (inhibit-modification-hooks t)
+                          (id 0))
+                      (erase-buffer)
+                      (insert
+                       (format "%s error:\n"
+                               (capitalize (format "%s" type))))
+                      (dolist (raw raw-lines)
+                        (insert "FUMOS-RAW " raw "\n"))
+                      (dolist (record (nreverse records))
+                        (let ((key (number-to-string (cl-incf id))))
+                          (puthash key record fumos-compilation--records)
+                          (insert
+                           (format "FUMOS-LOC %s: %s:%d:%d\n"
+                                   key
+                                   (fumos-source-authority-virtual
+                                    (fumos-locus-record-authority record))
+                                   (fumos-locus-record-line record)
+                                   (1+ (fumos-locus-record-column record))))))
+                      (goto-char (point-min))))
+                  (when (and
+                         (fumos-eval--error-staging-current-p
+                          staging context epoch staging-root
+                          staging-records staging-tokens)
+                         (eq previous
+                             (fumos-connection-error-buffer connection)))
+                    (setf (fumos-connection-error-buffer connection) staging)
+                    (setq committed t)
+                    (unwind-protect
+                        (let ((name
+                               (fumos-eval--error-buffer-name connection)))
+                          (when (and previous-owned
+                                     (buffer-live-p previous)
+                                     (eq staging
+                                         (fumos-connection-error-buffer
+                                          connection))
+                                     (fumos-eval--error-staging-current-p
+                                      staging context epoch staging-root
+                                      staging-records staging-tokens))
+                            (condition-case nil
+                                (with-current-buffer previous
+                                  (rename-buffer
+                                   (generate-new-buffer-name
+                                    (format " %s retired" name))
+                                   t))
+                              ((error quit) nil)))
+                          (when (and (buffer-live-p staging)
+                                     (eq staging
+                                         (fumos-connection-error-buffer
+                                          connection))
+                                     (fumos-eval--error-staging-current-p
+                                      staging context epoch staging-root
+                                      staging-records staging-tokens))
+                            (condition-case nil
+                                (with-current-buffer staging
+                                  (rename-buffer
+                                   (generate-new-buffer-name name) t))
+                              ((error quit) nil)))
+                          (when (and (buffer-live-p staging)
+                                     (eq staging
+                                         (fumos-connection-error-buffer
+                                          connection))
+                                     (fumos-eval--error-staging-current-p
+                                      staging context epoch staging-root
+                                      staging-records staging-tokens))
+                            (pcase fennel-proto-repl-error-buffer-action
+                              ('jump (pop-to-buffer staging))
+                              ('show (display-buffer staging)))
+                            (and
+                             (buffer-live-p staging)
+                             (eq staging
+                                 (fumos-connection-error-buffer connection))
+                             (fumos-eval--error-staging-current-p
+                              staging context epoch staging-root
+                              staging-records staging-tokens)
+                             staging)))
+                      (let ((published
+                             (fumos-connection-error-buffer connection)))
+                        (cond
+                         ((eq published staging)
+                          (if (fumos-eval--error-staging-current-p
+                               staging context epoch staging-root
+                               staging-records staging-tokens)
+                              (when (and previous-owned
+                                         (buffer-live-p previous))
+                                (fumos-repl--erase-and-kill-buffer previous))
+                            ;; Publish is a single slot CAS.  Restore history
+                            ;; only while the corrupted staging buffer still
+                            ;; owns that slot; a newer committed buffer wins.
+                            (setf (fumos-connection-error-buffer connection)
+                                  (and (buffer-live-p previous) previous))
+                            (setq committed nil)))
+                         ((eq published previous)
+                          (setq committed nil))
+                         ((fumos-eval--owned-error-buffer-p
+                           published connection
+                           (fumos-request-context-generation context))
+                          (when (and previous-owned
+                                     (buffer-live-p previous))
+                            (fumos-repl--erase-and-kill-buffer previous)))))))))
+            (when (and (buffer-live-p staging)
+                       (or (not committed)
+                           (not (eq staging
+                                    (fumos-connection-error-buffer
+                                     connection)))))
+              (fumos-repl--erase-and-kill-buffer staging))))))))
 
 (defun fumos-eval--owned-error-buffer ()
   "Return only the error buffer owned by the current FUMOS context."
@@ -711,9 +868,11 @@ Otherwise PATH is an untrusted wire path."
         :error
         (lambda (type message traceback)
           (unwind-protect
-              (let ((fumos-repl--error-context context))
-                (fumos-repl--default-error-handler
-                 type message traceback))
+              (when (and (marker-buffer marker)
+                         (marker-position marker))
+                (let ((fumos-repl--error-context context))
+                  (fumos-repl--default-error-handler
+                   type message traceback)))
             (funcall finish))))
        finish))))
 
@@ -984,21 +1143,72 @@ Otherwise PATH is an untrusted wire path."
     (when (eq query (fumos-eval--query-pending connection kind))
       (fumos-eval--set-query-pending connection kind nil))))
 
+(defun fumos-eval--release-query-marker (query)
+  "Release QUERY's temporary origin marker."
+  (when-let* ((marker (fumos-tool-query-marker query)))
+    (when (and (markerp marker) (marker-buffer marker))
+      (set-marker marker nil))))
+
 (defun fumos-eval--cancel-request (connection repl-buffer request-id)
-  "Rollback REQUEST-ID's callback ownership after a setup failure."
-  (when (and (integerp request-id) (buffer-live-p repl-buffer))
-    (with-current-buffer repl-buffer
-      (let ((delivery
-             (gethash request-id
-                      (fumos-repl--callback-delivery-table connection))))
-        (if (fumos-callback-delivery-p delivery)
+  "Cancel REQUEST-ID's callback, delivery, timer, and active ownership."
+  (when (integerp request-id)
+    (let* ((deliveries (fumos-repl--callback-delivery-table connection))
+           (delivery (and (hash-table-p deliveries)
+                          (gethash request-id deliveries))))
+      (when (fumos-callback-delivery-p delivery)
+        (condition-case nil
             (fumos-repl--rollback-callback-assignment
              connection repl-buffer delivery request-id)
-          (when (hash-table-p fennel-proto-repl--message-callbacks)
-            (fennel-proto-repl--unassign-callbacks request-id)))))
+          ((error quit) nil)))
+      (when (hash-table-p deliveries)
+        (remhash request-id deliveries))
+      (when (fumos-callback-delivery-p delivery)
+        ;; Canceled timer objects can outlive their registry entry until GC.
+        ;; Break their path back to query closures and source buffers now.
+        (setf (fumos-callback-delivery-process delivery) nil
+              (fumos-callback-delivery-repl-buffer delivery) nil
+              (fumos-callback-delivery-callbacks delivery) nil
+              (fumos-callback-delivery-values-callback delivery) nil
+              (fumos-callback-delivery-error-callback delivery) nil
+              (fumos-callback-delivery-print-callback delivery) nil)))
+    (when (buffer-live-p repl-buffer)
+      (condition-case nil
+          (with-current-buffer repl-buffer
+            (when (hash-table-p fennel-proto-repl--message-callbacks)
+              (remhash request-id fennel-proto-repl--message-callbacks)))
+        ((error quit) nil)))
     (setf (fumos-connection-active-request-ids connection)
           (delq request-id
-                (fumos-connection-active-request-ids connection)))))
+                (fumos-connection-active-request-ids connection)))
+    (when (and (null (fumos-connection-active-request-ids connection))
+               (eq 'busy (fumos-connection-state connection))
+               (fumos-repl--owns-transport-p
+                connection (fumos-connection-process connection)
+                (fumos-connection-generation connection)))
+      (condition-case nil
+          (fumos-repl--set-state connection 'ready)
+        ((error quit) nil)))))
+
+(defun fumos-eval--dispose-query (query &optional cancel-request)
+  "Release QUERY, canceling its request when CANCEL-REQUEST is non-nil."
+  (let ((connection (fumos-tool-query-connection query))
+        (repl-buffer (fumos-tool-query-repl-buffer query))
+        (request-id (fumos-tool-query-request-id query)))
+    (fumos-eval--clear-query-if-current query)
+    (when cancel-request
+      (fumos-eval--cancel-request connection repl-buffer request-id))
+    (fumos-eval--release-query-marker query)
+    (setf (fumos-tool-query-process query) nil
+          (fumos-tool-query-repl-buffer query) nil
+          (fumos-tool-query-source-buffer query) nil
+          (fumos-tool-query-source-context query) nil
+          (fumos-tool-query-authority query) nil
+          (fumos-tool-query-request-id query) nil
+          (fumos-tool-query-callback-identity query) nil
+          (fumos-tool-query-marker query) nil
+          (fumos-tool-query-window query) nil
+          (fumos-tool-query-display-action query) nil
+          (fumos-tool-query-callback query) nil)))
 
 (defun fumos-eval--query-error-context (query)
   "Return a captured error context for QUERY."
@@ -1009,19 +1219,23 @@ Otherwise PATH is an untrusted wire path."
 (defun fumos-eval--query-values (query handler values)
   "Deliver terminal VALUES to current QUERY through HANDLER."
   (when (fumos-eval--query-current-p query)
-    (fumos-eval--clear-query-if-current query)
-    (funcall handler query values)))
+    (let ((fumos-eval--error-current-p
+           (lambda () (fumos-eval--query-current-p query))))
+      (unwind-protect
+          (funcall handler query values)
+        (fumos-eval--dispose-query query t)))))
 
 (defun fumos-eval--query-error (query type message traceback)
   "Deliver one owned QUERY error, or discard it when it is stale."
   (when (fumos-eval--query-current-p query)
-    (fumos-eval--clear-query-if-current query)
-    (unwind-protect
-        (when (fumos-tool-query-show-errors query)
-          (let ((fumos-repl--error-context
-                 (fumos-eval--query-error-context query)))
-            (fumos-repl--default-error-handler type message traceback)))
-      (fumos-eval--release-query-marker query))))
+    (let ((fumos-eval--error-current-p
+           (lambda () (fumos-eval--query-current-p query))))
+      (unwind-protect
+          (when (fumos-tool-query-show-errors query)
+            (let ((fumos-repl--error-context
+                   (fumos-eval--query-error-context query)))
+              (fumos-repl--default-error-handler type message traceback)))
+        (fumos-eval--dispose-query query t)))))
 
 (defun fumos-eval--query-print (query handler data)
   "Deliver nonterminal print DATA to current QUERY through HANDLER."
@@ -1055,7 +1269,7 @@ Otherwise PATH is an untrusted wire path."
          request-id committed)
     (when-let* ((previous (fumos-eval--query-pending connection kind)))
       (when (fumos-tool-query-p previous)
-        (fumos-eval--release-query-marker previous)))
+        (fumos-eval--dispose-query previous t)))
     (fumos-eval--set-query-pending connection kind query)
     (unwind-protect
         (condition-case caught
@@ -1114,13 +1328,13 @@ Otherwise PATH is an untrusted wire path."
            (signal (car caught) (cdr caught))))
       (unless committed
         (fumos-eval--cancel-request connection repl-buffer request-id)
-        (fumos-eval--clear-query-if-current query)
-        (when (markerp marker) (set-marker marker nil))))))
+        (fumos-eval--dispose-query query nil)))))
 
 (defun fumos-eval--print-to-query-repl (query string)
   "Print STRING in QUERY's captured game REPL buffer."
   (let ((repl-buffer (fumos-tool-query-repl-buffer query)))
-    (when (buffer-live-p repl-buffer)
+    (when (and (buffer-live-p repl-buffer)
+               (fumos-eval--query-current-p query))
       (with-current-buffer repl-buffer
         (fennel-proto-repl--print string)))))
 
@@ -1238,16 +1452,16 @@ Otherwise PATH is an untrusted wire path."
           (xref-make summary
                      (xref-make-buffer-location buffer (point))))))))
 
-(defun fumos-eval--release-query-marker (query)
-  "Release QUERY's temporary origin marker."
-  (when-let* ((marker (fumos-tool-query-marker query)))
-    (when (markerp marker) (set-marker marker nil))))
+(defun fumos-eval--xref-ui-current-p (query)
+  "Return non-nil when QUERY may still cross an xref UI boundary."
+  (fumos-eval--query-current-p query))
 
 (defun fumos-eval--display-definition-xrefs (query xrefs)
   "Display immutable XREFS with the public definition UX for QUERY."
   (let ((marker (fumos-tool-query-marker query))
         (window (fumos-tool-query-window query)))
-    (if (not (and (markerp marker) (marker-buffer marker)
+    (if (not (and (fumos-eval--xref-ui-current-p query)
+                  (markerp marker) (marker-buffer marker)
                   (window-live-p window)))
         (fumos-eval--release-query-marker query)
       (let* ((immutable (copy-sequence xrefs))
@@ -1258,8 +1472,10 @@ Otherwise PATH is an untrusted wire path."
                 (auto-jump . ,xref-auto-jump-to-first-definition))))
         (unwind-protect
             (with-selected-window window
-              (xref-push-marker-stack (copy-marker marker))
-              (funcall xref-show-definitions-function fetcher alist))
+              (when (fumos-eval--xref-ui-current-p query)
+                (xref-push-marker-stack (copy-marker marker))
+                (when (fumos-eval--xref-ui-current-p query)
+                  (funcall xref-show-definitions-function fetcher alist))))
           (fumos-eval--release-query-marker query))))))
 
 (defun fumos-eval--find-values (query values)
@@ -1285,13 +1501,15 @@ Otherwise PATH is an untrusted wire path."
             (fumos-error-handler
              "find" "FUMOS find returned an unsafe locus" nil
              (fumos-eval--query-error-context query)))
-        (puthash
-         (fumos-tool-query-symbol query)
-         (list :generation (fumos-tool-query-generation query)
-               :xrefs (list xref))
-         (fumos-connection-xref-cache
-          (fumos-tool-query-connection query)))
-        (fumos-eval--display-definition-xrefs query (list xref)))))))
+        (if (not (fumos-eval--query-current-p query))
+            (fumos-eval--release-query-marker query)
+          (puthash
+           (fumos-tool-query-symbol query)
+           (list :generation (fumos-tool-query-generation query)
+                 :xrefs (list xref))
+           (fumos-connection-xref-cache
+            (fumos-tool-query-connection query)))
+          (fumos-eval--display-definition-xrefs query (list xref))))))))
 
 (defun fumos-eval--find-definition (symbol display-action)
   "Start an asynchronous definition lookup using DISPLAY-ACTION."
@@ -1384,6 +1602,8 @@ Otherwise PATH is an untrusted wire path."
      (eq query
          (gethash (fumos-completion-query-key query)
                   (fumos-connection-completion-pending connection)))
+     (eql (fumos-completion-query-epoch query)
+          (fumos-connection-completion-epoch connection))
      (eq (fumos-completion-query-repl-buffer query)
          (fumos-connection-repl-buffer connection))
      (fumos-repl--owns-transport-p
@@ -1403,6 +1623,24 @@ Otherwise PATH is an untrusted wire path."
          (key (fumos-completion-query-key query)))
     (when (eq query (gethash key table))
       (remhash key table))))
+
+(defun fumos-eval--dispose-completion-query (query &optional cancel-request)
+  "Release completion QUERY and optionally cancel its transport request."
+  (let ((connection (fumos-completion-query-connection query))
+        (repl-buffer (fumos-completion-query-repl-buffer query))
+        (request-id (fumos-completion-query-request-id query)))
+    (fumos-eval--clear-completion-query query)
+    (when cancel-request
+      (fumos-eval--cancel-request connection repl-buffer request-id))
+    (setf (fumos-completion-query-process query) nil
+          (fumos-completion-query-repl-buffer query) nil
+          (fumos-completion-query-source-buffer query) nil
+          (fumos-completion-query-source-context query) nil
+          (fumos-completion-query-key query) nil
+          (fumos-completion-query-prefix query) nil
+          (fumos-completion-query-request-id query) nil
+          (fumos-completion-query-callback-identity query) nil
+          (fumos-completion-query-candidates query) nil)))
 
 (defun fumos-eval--completion-wire-kinds (value candidates)
   "Parse VALUE into an immutable candidate kind alist."
@@ -1429,7 +1667,7 @@ Otherwise PATH is an untrusted wire path."
       :candidates (copy-sequence candidates) :kinds (copy-tree kinds))
      (fumos-connection-completion-cache
       (fumos-completion-query-connection query)))
-    (fumos-eval--clear-completion-query query)))
+    (fumos-eval--dispose-completion-query query t)))
 
 (defun fumos-eval--completion-kinds-values (query values)
   "Commit a kind-annotated completion QUERY from terminal VALUES."
@@ -1441,7 +1679,7 @@ Otherwise PATH is an untrusted wire path."
       (if kinds
           (fumos-eval--commit-completion
            query (fumos-completion-query-candidates query) kinds)
-        (fumos-eval--clear-completion-query query)))))
+        (fumos-eval--dispose-completion-query query t)))))
 
 (defun fumos-eval--completion-send-kinds (query candidates)
   "Start QUERY's optional asynchronous kind request for CANDIDATES."
@@ -1456,9 +1694,11 @@ Otherwise PATH is an untrusted wire path."
              (lambda (candidate) (format "(symbol-type %S)" candidate))
              candidates " "))
            t))
+         (previous-request-id (fumos-completion-query-request-id query))
          request-id committed)
     ;; The values callback that reached this point has already validated the
     ;; first request.  Replace only this key with a new callback identity.
+    (fumos-eval--cancel-request connection repl-buffer previous-request-id)
     (setf (fumos-completion-query-candidates query) candidates
           (fumos-completion-query-request-id query) nil
           (fumos-completion-query-callback-identity query) nil)
@@ -1476,7 +1716,7 @@ Otherwise PATH is an untrusted wire path."
                         :error
                         (lambda (&rest _)
                           (when (fumos-eval--completion-query-current-p query)
-                            (fumos-eval--clear-completion-query query)))
+                            (fumos-eval--dispose-completion-query query t)))
                         :print #'ignore)))
                 (setf
                  (fumos-completion-query-request-id query) request-id
@@ -1489,13 +1729,13 @@ Otherwise PATH is an untrusted wire path."
           ((error quit) nil))
       (unless committed
         (fumos-eval--cancel-request connection repl-buffer request-id)
-        (fumos-eval--clear-completion-query query)))))
+        (fumos-eval--dispose-completion-query query nil)))))
 
 (defun fumos-eval--completion-values (query values)
   "Validate completion VALUES and commit or request optional kinds."
   (when (fumos-eval--completion-query-current-p query)
     (if (not (and (proper-list-p values) (seq-every-p #'stringp values)))
-        (fumos-eval--clear-completion-query query)
+        (fumos-eval--dispose-completion-query query t)
       (let ((candidates (delete-dups (copy-sequence values))))
         (if (and (fumos-completion-query-annotate query) candidates)
             (fumos-eval--completion-send-kinds query candidates)
@@ -1507,8 +1747,18 @@ Otherwise PATH is an untrusted wire path."
          (generation (fumos-connection-generation connection))
          (repl-buffer (fumos-connection-repl-buffer connection))
          (key (cons source prefix))
-         (pending (fumos-connection-completion-pending connection)))
-    (unless (gethash key pending)
+         (pending (fumos-connection-completion-pending connection))
+         (existing (gethash key pending)))
+    (unless (and (fumos-completion-query-p existing)
+                 (fumos-eval--completion-query-current-p existing))
+      (let (obsolete)
+        (maphash
+         (lambda (_old-key old-query)
+           (when (fumos-completion-query-p old-query)
+             (push old-query obsolete)))
+         pending)
+        (dolist (old-query obsolete)
+          (fumos-eval--dispose-completion-query old-query t)))
       (let* ((epoch
               (setf (fumos-connection-completion-epoch connection)
                     (1+ (or (fumos-connection-completion-epoch connection) 0))))
@@ -1533,7 +1783,7 @@ Otherwise PATH is an untrusted wire path."
                           :error
                           (lambda (&rest _)
                             (when (fumos-eval--completion-query-current-p query)
-                              (fumos-eval--clear-completion-query query)))
+                              (fumos-eval--dispose-completion-query query t)))
                           :print #'ignore)))
                   (setf
                    (fumos-completion-query-request-id query) request-id
@@ -1546,7 +1796,7 @@ Otherwise PATH is an untrusted wire path."
               ((error quit) nil))
           (unless committed
             (fumos-eval--cancel-request connection repl-buffer request-id)
-            (fumos-eval--clear-completion-query query)))))))
+            (fumos-eval--dispose-completion-query query nil)))))))
 
 (defun fumos-eval--completion-kind (kinds item)
   "Return completion kind symbol for ITEM from immutable KINDS."
@@ -1592,12 +1842,20 @@ Otherwise PATH is an untrusted wire path."
                 (apply-partially #'fumos-eval--completion-kind kinds)))))))
 
 (defun fumos-eval--release-tooling-markers (connection)
-  "Release temporary origin markers owned by CONNECTION's pending tooling."
+  "Cancel and release every pending tooling resource for CONNECTION."
   (dolist (query (list (fumos-connection-help-pending connection)
                        (fumos-connection-xref-pending connection)
                        (fumos-connection-eldoc-pending connection)))
     (when (fumos-tool-query-p query)
-      (fumos-eval--release-query-marker query))))
+      (fumos-eval--dispose-query query t)))
+  (let (queries)
+    (when (hash-table-p (fumos-connection-completion-pending connection))
+      (maphash
+       (lambda (_key query)
+         (when (fumos-completion-query-p query) (push query queries)))
+       (fumos-connection-completion-pending connection)))
+    (dolist (query queries)
+      (fumos-eval--dispose-completion-query query t))))
 
 (defun fumos-eval--invalidate-source-tooling (connection _source)
   "Invalidate pending source tooling before CONNECTION ownership changes."
