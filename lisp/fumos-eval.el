@@ -1973,6 +1973,9 @@ Otherwise PATH is an untrusted wire path."
 (defvar fumos-eval--last-generated-lua nil
   "Last Lua source returned by an explicit compile preview.")
 
+(defconst fumos-eval--compile-wire-prefix-lines 2
+  "Synthetic lines before source in a pinned persistent REPL compile.")
+
 (defun fumos-eval--show-lua-values (values)
   "Validate and display the single generated Lua value in VALUES."
   (if (not (and (consp values)
@@ -2012,9 +2015,10 @@ Otherwise PATH is an untrusted wire path."
       (let* ((wire-line (string-to-number (match-string 1 message)))
              (wire-column (string-to-number (match-string 2 message)))
              (suffix (substring message (match-end 0))))
-        (if (< wire-line 2)
+        (if (<= wire-line fumos-eval--compile-wire-prefix-lines)
             message
-          (let* ((source-line (1- wire-line))
+          (let* ((source-line
+                  (- wire-line fumos-eval--compile-wire-prefix-lines))
                  (absolute-line (+ source-start-line source-line -1))
                  (absolute-column
                   (if (= source-line 1)

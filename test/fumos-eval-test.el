@@ -1135,13 +1135,15 @@
     (erase-buffer)
     (insert "(bad-first)\n(bad-second)\n\t中文(bad-third)\n(fn)\n")
     (let ((responses
-           ;; Pinned Fennel 1.6.1 reports SOURCE line 4 as wire line 5 for
-           ;; `,compile (do\nSOURCE\n)`: only the opening `(do` adds a line.
-           '("Error compiling expression: unknown:2:0: first"
-             "Error compiling expression: unknown:3:0: second"
-             "Error compiling expression: unknown:4:3: unicode"
-             "Error compiling expression: unknown:5:0: real-shape"
+           ;; Pinned Fennel 1.6.1 reports SOURCE line 4 as wire line 6 once
+           ;; the persistent REPL has consumed its bootstrap.  The established
+           ;; parser baseline and the opening `(do` each add one synthetic line.
+           '("Error compiling expression: unknown:3:0: first"
+             "Error compiling expression: unknown:4:0: second"
+             "Error compiling expression: unknown:5:3: unicode"
+             "Error compiling expression: unknown:6:0: real-shape"
              "Compile error: unknown:2:0: hostile-prefix"
+             "Error compiling expression: unknown:2:0: repl-baseline"
              "Error compiling expression: unknown:1:0: wrapper"))
           received)
       (setf
@@ -1161,6 +1163,7 @@
                    "Error compiling expression: mods/demo/scripts/foo.fnl:3:4: unicode"
                    "Error compiling expression: mods/demo/scripts/foo.fnl:4:1: real-shape"
                    "Compile error: unknown:2:0: hostile-prefix"
+                   "Error compiling expression: unknown:2:0: repl-baseline"
                    "Error compiling expression: unknown:1:0: wrapper"))
           (let ((before (length received)))
             (fumos-compile-buffer)
@@ -1198,7 +1201,7 @@
              (when (fumos-test-command-request-p line)
                (fumos-test-send-compile-error
                 state client line
-                "Error compiling expression: unknown:2:0: offset"))))
+                "Error compiling expression: unknown:3:0: offset"))))
           (fumos-compile-defun)
           (should
            (fumos-test-wait-until
