@@ -3,6 +3,15 @@
 
 (require 'cl-lib)
 
+(declare-function fumos-eval-last-sexp "fumos-eval")
+(declare-function fumos-eval-defun "fumos-eval")
+(declare-function fumos-eval-region "fumos-eval")
+(declare-function fumos-eval-buffer "fumos-eval")
+(declare-function fumos-reload-current-file "fumos-eval")
+(declare-function fumos-switch-to-repl "fumos-repl")
+(declare-function fumos-repl-link-current-buffer "fumos-repl")
+(declare-function fumos-repl-unlink-current-buffer "fumos-repl")
+
 (defvar fumos-project--installed nil)
 
 (defvar fumos-mode-map
