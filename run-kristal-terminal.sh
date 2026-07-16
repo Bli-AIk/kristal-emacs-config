@@ -25,8 +25,8 @@ case "$script_path" in
     ;;
 esac
 
-script_dir=$(CDPATH= cd "$(dirname "$script_path")" && pwd -P)
-mod_root=$(CDPATH= cd "$script_dir/.." && pwd -P)
+script_dir=$(CDPATH='' cd "$(dirname "$script_path")" && pwd -P)
+mod_root=$(CDPATH='' cd "$script_dir/.." && pwd -P)
 
 mod_id=""
 if [ -f "$mod_root/mod.json" ]; then
@@ -52,7 +52,7 @@ find_engine_root() {
     "$HOME/Kristal"
   do
     if [ -f "$candidate/main.lua" ]; then
-      CDPATH= cd "$candidate" && pwd -P
+      CDPATH='' cd "$candidate" && pwd -P
       return 0
     fi
   done
@@ -93,6 +93,7 @@ fi
 case "$terminal" in
   kitty)
     if [ "$hold" -eq 1 ]; then
+      # shellcheck disable=SC2016
       kitty --detach --hold --title "$title" --directory "$engine_root" \
         sh -c 'love "$1" --mod "$2" --auto-mod-start; status=$?; printf "\nLove exited with status %s\n" "$status"; exec "${SHELL:-sh}" -i' \
         sh "$engine_root" "$mod_id" >/dev/null 2>&1
@@ -103,6 +104,7 @@ case "$terminal" in
     ;;
   xterm)
     if [ "$hold" -eq 1 ]; then
+      # shellcheck disable=SC2016
       xterm -hold -T "$title" -e sh -c \
         'love "$1" --mod "$2" --auto-mod-start; status=$?; printf "\nLove exited with status %s\n" "$status"; exec "${SHELL:-sh}" -i' \
         sh "$engine_root" "$mod_id" >/dev/null 2>&1 &

@@ -23,7 +23,7 @@ esac
 install_root="$data_home/kristal-emacs-config/fennel-ls"
 prefix="$install_root/$short_commit"
 docset_dir="$data_home/fennel-ls/docsets"
-script_dir=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
+script_dir=$(CDPATH='' cd "$(dirname "$0")/.." && pwd -P)
 command -v flock >/dev/null 2>&1 || {
     printf '%s\n' 'flock is required on Linux' >&2
     exit 1

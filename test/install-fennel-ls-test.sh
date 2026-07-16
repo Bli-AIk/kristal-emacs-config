@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repo=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
+repo=$(CDPATH='' cd "$(dirname "$0")/.." && pwd -P)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 fake_bin="$tmp/bin"
