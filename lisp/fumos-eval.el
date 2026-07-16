@@ -2093,14 +2093,42 @@ Otherwise PATH is an untrusted wire path."
   connection generation transport-generation mode pid root start-identity
   token-digest deadline)
 
+(defun fumos-eval--linux-stat-start-ticks (contents)
+  "Return Linux proc stat start ticks parsed from CONTENTS, or nil."
+  (let ((text (string-trim-right contents "[\r\n]+")))
+    ;; The greedy comm capture ends at the final `) STATE ' delimiter, so a
+    ;; process name containing spaces or right parentheses remains harmless.
+    (when (string-match
+           "\\`[0-9]+ (.*) [[:alpha:]] \\(.*\\)\\'" text)
+      (let* ((fields (split-string (match-string 1 text) "[[:space:]]+" t))
+             (start (nth 18 fields)))
+        (when (and start (string-match-p "\\`[0-9]+\\'" start))
+          (string-to-number start))))))
+
+(defun fumos-eval--linux-process-start-identity (pid)
+  "Return PID's stable Linux kernel start identity, or nil."
+  (when (and (eq system-type 'gnu/linux) (integerp pid) (> pid 0))
+    (condition-case nil
+        (with-temp-buffer
+          (set-buffer-multibyte nil)
+          (insert-file-contents-literally (format "/proc/%d/stat" pid))
+          (when-let* ((ticks
+                       (fumos-eval--linux-stat-start-ticks (buffer-string))))
+            (list 'linux-start-ticks ticks)))
+      (error nil))))
+
 (defun fumos-eval--process-start-identity (pid)
   "Return PID's normalized current-user process start identity, or nil."
   (condition-case nil
       (let* ((attributes (process-attributes pid))
              (euid (and attributes (alist-get 'euid attributes)))
-             (start (and attributes (alist-get 'start attributes))))
+             (start (and attributes (alist-get 'start attributes)))
+             (comm (and attributes (alist-get 'comm attributes))))
         (when (and (integerp euid) (= euid (user-uid)) start)
-          (time-convert start 'list)))
+          (or (and (stringp comm)
+                   (fumos-eval--linux-process-start-identity pid))
+              (list 'process-attributes-start
+                    (time-convert start 'list)))))
     (error nil)))
 
 (defun fumos-eval--canonical-game-root (root)

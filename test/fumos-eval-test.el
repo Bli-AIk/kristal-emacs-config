@@ -1334,6 +1334,17 @@
     :mod-id "demo" :pid (or pid 4242) :token token)
    :state 'ready :generation 7 :game-reload-generation 0))
 
+(ert-deftest fumos-linux-process-start-ticks-parses-complex-comm ()
+  (let ((fields (mapconcat #'number-to-string (number-sequence 1 30) " ")))
+    (should
+     (= 19
+        (fumos-eval--linux-stat-start-ticks
+         (format "42 (odd ) S process name) R %s\n" fields))))
+    (should-not (fumos-eval--linux-stat-start-ticks "42 malformed\n"))
+    (should-not
+     (fumos-eval--linux-stat-start-ticks
+      "42 (name) R 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 nope\n"))))
+
 (ert-deftest fumos-game-reload-public-modes-use-guarded-global ()
   (fumos-test-with-ready-connection (connection server)
     (let ((start (current-time))
