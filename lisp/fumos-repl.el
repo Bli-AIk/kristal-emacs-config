@@ -8,6 +8,12 @@
 (require 'fumos-instance)
 (require 'fumos-project)
 
+(declare-function fumos-completion-at-point "fumos-eval")
+(declare-function fumos-eldoc-function "fumos-eval")
+(declare-function fumos-repl--xref-backend "fumos-eval")
+(declare-function fumos-eval--invalidate-source-tooling "fumos-eval")
+(declare-function fumos-eval--release-tooling-markers "fumos-eval")
+
 (defcustom fumos-handshake-timeout 2.0
   "Seconds allowed for the FUMOS authentication handshake."
   :type 'number
@@ -42,7 +48,10 @@
 (define-minor-mode fumos-repl-mode
   "Mark an upstream proto buffer as a FUMOS game REPL."
   :lighter " FUMOS-REPL"
-  :keymap fumos-repl-mode-map)
+  :keymap fumos-repl-mode-map
+  (if fumos-repl-mode
+      (fumos-repl--install-game-editing-state)
+    (fumos-repl--restore-game-editing-state)))
 
 (cl-defstruct fumos-connection
   instance process process-buffer repl-buffer ui-process state handshake-buffer
@@ -50,7 +59,9 @@
   last-error generation retry-timers callback-timers callback-deliveries closing
   terminal-timers terminal-deliveries game-reload-timer game-reload-generation
   linked-buffers macro-cache macro-cache-valid macro-refresh-pending
-  macro-refresh-id macro-refresh-generation macro-refresh-epoch)
+  macro-refresh-id macro-refresh-generation macro-refresh-epoch error-buffer
+  help-epoch help-pending xref-epoch xref-pending xref-cache eldoc-epoch
+  eldoc-pending completion-epoch completion-pending completion-cache)
 
 (defvar fumos-repl--connections (make-hash-table :test #'equal))
 (defvar fumos-repl--attach-transitions (make-hash-table :test #'equal)
@@ -287,7 +298,11 @@
    :active-request-ids nil :retry-timers nil :callback-timers nil
    :callback-deliveries (make-hash-table :test #'eql)
    :terminal-timers nil :terminal-deliveries nil
-   :game-reload-generation 0 :macro-refresh-epoch 0))
+   :game-reload-generation 0 :macro-refresh-epoch 0
+   :help-epoch 0 :xref-epoch 0 :xref-cache (make-hash-table :test #'equal)
+   :eldoc-epoch 0 :completion-epoch 0
+   :completion-pending (make-hash-table :test #'equal)
+   :completion-cache (make-hash-table :test #'equal)))
 
 (defun fumos-repl--open-instance (connection)
   "Create buffers/socket and send AUTH for CONNECTION as one transaction."
@@ -960,11 +975,109 @@
 (defvar-local fumos-repl--source-previous-module-value nil
   "Proto module name captured before the first FUMOS source owner.")
 
+(defvar-local fumos-repl--source-previous-editing-state nil
+  "Editing hooks and font-lock state captured before FUMOS ownership.")
+
 (defvar-local fumos-repl--source-link-transition nil
   "Identity token for the source link transaction currently in flight.")
 
 (defvar fumos-repl--internal-link-target nil
   "REPL target being installed by a FUMOS source link transaction.")
+
+(defvar-local fumos-repl--game-editing-owned nil
+  "Non-nil when the current game REPL owns its editing configuration.")
+
+(defvar-local fumos-repl--game-editing-state nil
+  "Ordinary proto editing state replaced by `fumos-repl-mode'.")
+
+(defun fumos-repl--capture-local-value (symbol)
+  "Capture SYMBOL's exact current localness and value."
+  (list :local-p (local-variable-p symbol)
+        :value (and (boundp symbol) (symbol-value symbol))))
+
+(defun fumos-repl--restore-local-value (symbol snapshot)
+  "Restore SYMBOL from local-value SNAPSHOT."
+  (if (plist-get snapshot :local-p)
+      (set (make-local-variable symbol) (plist-get snapshot :value))
+    (kill-local-variable symbol)))
+
+(defun fumos-repl--capture-editing-state ()
+  "Capture the exact buffer-local tooling state replaced by FUMOS."
+  (list
+   :font-lock
+   (fumos-repl--capture-local-value
+    'fennel-proto-repl-font-lock-dynamically)
+   :completion
+   (fumos-repl--capture-local-value 'completion-at-point-functions)
+   :xref (fumos-repl--capture-local-value 'xref-backend-functions)
+   :eldoc
+   (fumos-repl--capture-local-value 'eldoc-documentation-functions)))
+
+(defun fumos-repl--restore-editing-state (snapshot)
+  "Restore the current buffer's tooling state from SNAPSHOT."
+  (when snapshot
+    (fumos-repl--restore-local-value
+     'fennel-proto-repl-font-lock-dynamically
+     (plist-get snapshot :font-lock))
+    (fumos-repl--restore-local-value
+     'completion-at-point-functions (plist-get snapshot :completion))
+    (fumos-repl--restore-local-value
+     'xref-backend-functions (plist-get snapshot :xref))
+    (fumos-repl--restore-local-value
+     'eldoc-documentation-functions (plist-get snapshot :eldoc))))
+
+(defun fumos-repl--without-global-font-lock (value)
+  "Return VALUE with dynamic `global' font lock removed in order."
+  (if (listp value)
+      (delq 'global (copy-sequence value))
+    value))
+
+(defun fumos-repl--install-owned-editing-state ()
+  "Install nonblocking editing hooks in the current FUMOS buffer."
+  (setq-local
+   fennel-proto-repl-fennel-module-name fumos-repl-fennel-module-name
+   fennel-proto-repl-font-lock-dynamically
+   (fumos-repl--without-global-font-lock
+    fennel-proto-repl-font-lock-dynamically))
+  (remove-hook 'completion-at-point-functions
+               #'fennel-proto-repl-complete t)
+  (remove-hook 'completion-at-point-functions
+               #'fumos-completion-at-point t)
+  (add-hook 'completion-at-point-functions
+            #'fumos-completion-at-point nil t)
+  (remove-hook 'xref-backend-functions
+               #'fennel-proto-repl--xref-backend t)
+  (remove-hook 'xref-backend-functions #'fumos-repl--xref-backend t)
+  (add-hook 'xref-backend-functions #'fumos-repl--xref-backend nil t)
+  (remove-hook 'eldoc-documentation-functions
+               #'fennel-proto-repl-eldoc-fn-docstring t)
+  (remove-hook 'eldoc-documentation-functions
+               #'fennel-proto-repl-eldoc-var-docstring t)
+  (remove-hook 'eldoc-documentation-functions #'fumos-eldoc-function t)
+  (add-hook 'eldoc-documentation-functions #'fumos-eldoc-function nil t))
+
+(defun fumos-repl--install-game-editing-state ()
+  "Replace synchronous upstream tooling in a FUMOS game REPL."
+  (unless fumos-repl--game-editing-owned
+    (setq fumos-repl--game-editing-owned t
+          fumos-repl--game-editing-state
+          (list
+           :module
+           (fumos-repl--capture-local-value
+            'fennel-proto-repl-fennel-module-name)
+           :editing (fumos-repl--capture-editing-state))))
+  (fumos-repl--install-owned-editing-state))
+
+(defun fumos-repl--restore-game-editing-state ()
+  "Restore ordinary proto tooling after leaving `fumos-repl-mode'."
+  (when fumos-repl--game-editing-owned
+    (let ((snapshot fumos-repl--game-editing-state))
+      (setq fumos-repl--game-editing-owned nil
+            fumos-repl--game-editing-state nil)
+      (fumos-repl--restore-editing-state (plist-get snapshot :editing))
+      (fumos-repl--restore-local-value
+       'fennel-proto-repl-fennel-module-name
+       (plist-get snapshot :module)))))
 
 (defun fumos-repl--live-previous-upstream-buffer ()
   "Return the saved ordinary target while it is still live."
@@ -987,7 +1100,12 @@
          (previous-mode fumos-repl--source-previous-upstream-mode)
          (previous-module-local-p
           fumos-repl--source-previous-module-local-p)
-         (previous-module-value fumos-repl--source-previous-module-value))
+         (previous-module-value fumos-repl--source-previous-module-value)
+         (previous-editing-state
+          fumos-repl--source-previous-editing-state))
+    (when (and connection
+               (fboundp 'fumos-eval--invalidate-source-tooling))
+      (fumos-eval--invalidate-source-tooling connection source))
     ;; Clear identity before any minor-mode hook can re-enter cleanup.
     (setq fumos-repl--source-owner nil
           fumos-repl--source-enabled-upstream-mode nil
@@ -995,6 +1113,7 @@
           fumos-repl--source-previous-upstream-mode nil
           fumos-repl--source-previous-module-local-p nil
           fumos-repl--source-previous-module-value nil
+          fumos-repl--source-previous-editing-state nil
           fumos-repl--source-link-transition nil)
     (when connection
       (setf (fumos-connection-linked-buffers connection)
@@ -1004,7 +1123,6 @@
     (remove-hook 'kill-buffer-hook #'fumos-repl--source-kill-cleanup t)
     (remove-hook 'fennel-proto-repl-minor-mode-hook
                  #'fumos-repl--source-upstream-mode-change t)
-    (remove-hook 'xref-backend-functions 'fumos-repl--xref-backend t)
     (when (and (not preserve-upstream)
                (eq fennel-proto-repl--buffer owned-repl))
       ;; Restore both halves of the snapshot.  Set the target before enabling
@@ -1026,6 +1144,7 @@
          (setq fennel-proto-repl--buffer previous-buffer))
         (error
          (setq fennel-proto-repl--buffer previous-buffer))))
+    (fumos-repl--restore-editing-state previous-editing-state)
     connection))
 
 (defun fumos-repl--source-upstream-mode-change ()
@@ -1082,6 +1201,28 @@
     (quit nil)
     (error nil)))
 
+(defun fumos-repl--invalidate-tooling-state (connection)
+  "Invalidate every asynchronous editing query owned by CONNECTION."
+  (when (fboundp 'fumos-eval--release-tooling-markers)
+    (fumos-eval--release-tooling-markers connection))
+  (setf (fumos-connection-help-epoch connection)
+        (1+ (or (fumos-connection-help-epoch connection) 0))
+        (fumos-connection-help-pending connection) nil
+        (fumos-connection-xref-epoch connection)
+        (1+ (or (fumos-connection-xref-epoch connection) 0))
+        (fumos-connection-xref-pending connection) nil
+        (fumos-connection-eldoc-epoch connection)
+        (1+ (or (fumos-connection-eldoc-epoch connection) 0))
+        (fumos-connection-eldoc-pending connection) nil
+        (fumos-connection-completion-epoch connection)
+        (1+ (or (fumos-connection-completion-epoch connection) 0)))
+  (when (hash-table-p (fumos-connection-xref-cache connection))
+    (clrhash (fumos-connection-xref-cache connection)))
+  (when (hash-table-p (fumos-connection-completion-pending connection))
+    (clrhash (fumos-connection-completion-pending connection)))
+  (when (hash-table-p (fumos-connection-completion-cache connection))
+    (clrhash (fumos-connection-completion-cache connection))))
+
 (defun fumos-repl--teardown-transport (connection message)
   "Invalidate CONNECTION and release transport resources, preserving history."
   (let ((first-teardown (not (fumos-connection-closing connection))))
@@ -1098,6 +1239,7 @@
           (fumos-connection-macro-refresh-generation connection) nil
           (fumos-connection-macro-refresh-epoch connection)
           (1+ (or (fumos-connection-macro-refresh-epoch connection) 0)))
+    (fumos-repl--invalidate-tooling-state connection)
     (fumos-repl--cancel-callback-deliveries connection)
     (fumos-repl--cancel-timer
      (fumos-connection-handshake-timer connection))
@@ -1616,6 +1758,7 @@
    :previous-mode fumos-repl--source-previous-upstream-mode
    :previous-module-local-p fumos-repl--source-previous-module-local-p
    :previous-module-value fumos-repl--source-previous-module-value
+   :previous-editing-state fumos-repl--source-previous-editing-state
    :module-local-p
    (local-variable-p 'fennel-proto-repl-fennel-module-name)
    :module-value fennel-proto-repl-fennel-module-name
@@ -1624,9 +1767,7 @@
    :transition fumos-repl--source-link-transition
    :kill-hooks kill-buffer-hook
    :mode-hooks fennel-proto-repl-minor-mode-hook
-   :completion-hooks completion-at-point-functions
-   :xref-hooks xref-backend-functions
-   :eldoc-hooks eldoc-documentation-functions
+   :editing-state (fumos-repl--capture-editing-state)
    :links (mapcar (lambda (value)
                     (cons value
                           (copy-sequence
@@ -1648,16 +1789,15 @@
         (plist-get snapshot :previous-module-local-p)
         fumos-repl--source-previous-module-value
         (plist-get snapshot :previous-module-value)
+        fumos-repl--source-previous-editing-state
+        (plist-get snapshot :previous-editing-state)
         fennel-proto-repl--buffer (plist-get snapshot :target)
         fennel-proto-repl-minor-mode (plist-get snapshot :mode)
         fumos-repl--source-link-transition
         (plist-get snapshot :transition)
         kill-buffer-hook (plist-get snapshot :kill-hooks)
-        fennel-proto-repl-minor-mode-hook (plist-get snapshot :mode-hooks)
-        completion-at-point-functions
-        (plist-get snapshot :completion-hooks)
-        xref-backend-functions (plist-get snapshot :xref-hooks)
-        eldoc-documentation-functions (plist-get snapshot :eldoc-hooks))
+        fennel-proto-repl-minor-mode-hook (plist-get snapshot :mode-hooks))
+  (fumos-repl--restore-editing-state (plist-get snapshot :editing-state))
   (fumos-repl--restore-source-module-name
    (plist-get snapshot :module-local-p)
    (plist-get snapshot :module-value)))
@@ -1684,6 +1824,10 @@
             (if old-owner
                 fumos-repl--source-previous-module-value
               fennel-proto-repl-fennel-module-name))
+           (previous-editing-state
+            (if old-owner
+                fumos-repl--source-previous-editing-state
+              (fumos-repl--capture-editing-state)))
            (repl-buffer (fumos-connection-repl-buffer connection))
            (ticket (list 'fumos-source-link connection buffer))
            (snapshot
@@ -1694,6 +1838,12 @@
             fennel-proto-repl--buffer repl-buffer)
       (setq-local fennel-proto-repl-fennel-module-name
                   fumos-repl-fennel-module-name)
+      ;; Upstream mode enable and link both refresh font lock synchronously.
+      ;; Remove only the global query before either path can run.
+      (setq-local
+       fennel-proto-repl-font-lock-dynamically
+       (fumos-repl--without-global-font-lock
+        fennel-proto-repl-font-lock-dynamically))
       (condition-case caught
           (let ((fumos-repl--internal-link-target repl-buffer))
             (unless fennel-proto-repl-minor-mode
@@ -1702,6 +1852,10 @@
               (setq superseded t))
             (unless superseded
               (fennel-proto-repl--link-buffer repl-buffer)
+              (unless (eq ticket fumos-repl--source-link-transition)
+                (setq superseded t)))
+            (unless superseded
+              (fumos-repl--install-owned-editing-state)
               (unless (eq ticket fumos-repl--source-link-transition)
                 (setq superseded t))))
         ((error quit) (setq failure caught)))
@@ -1725,15 +1879,14 @@
               fumos-repl--source-previous-module-local-p
               previous-module-local-p
               fumos-repl--source-previous-module-value previous-module-value
+              fumos-repl--source-previous-editing-state
+              previous-editing-state
               fumos-repl--source-link-transition nil)
         (cl-pushnew buffer
                     (fumos-connection-linked-buffers connection) :test #'eq)
         (add-hook 'kill-buffer-hook #'fumos-repl--source-kill-cleanup nil t)
         (add-hook 'fennel-proto-repl-minor-mode-hook
                   #'fumos-repl--source-upstream-mode-change nil t)
-        (when (fboundp 'fumos-repl--xref-backend)
-          (add-hook 'xref-backend-functions
-                    'fumos-repl--xref-backend nil t))
         connection)))))
 
 (defun fumos-repl-link-current-buffer ()
@@ -2002,10 +2155,13 @@ error or quit to `fumos-repl-connection-error' after complete cleanup."
   "Return VALUE's exact UTF-8 wire byte count."
   (string-bytes (encode-coding-string value 'utf-8-unix)))
 
+(defvar fumos-repl--error-context nil
+  "Dynamically captured authority passed to the FUMOS error UI.")
+
 (defun fumos-repl--default-error-handler (type message traceback)
   "Route a FUMOS eval error through the installed source-aware handler."
   (if (fboundp 'fumos-error-handler)
-      (fumos-error-handler type message traceback)
+      (fumos-error-handler type message traceback fumos-repl--error-context)
     (fennel-proto-repl--error-handler type message traceback)))
 
 (defun fumos-repl--send-framed-request
@@ -2064,7 +2220,8 @@ error or quit to `fumos-repl-connection-error' after complete cleanup."
      (lambda (id) (fumos-repl--format-eval-request id code source))
      callbacks '(ready busy))))
 
-(defconst fumos-repl--command-ops '(:reload :compile)
+(defconst fumos-repl--command-ops
+  '(:reload :compile :complete :doc :apropos :find)
   "Protocol operations accepted by `fumos-repl-send-command'.")
 
 (defun fumos-repl-send-command (op data callbacks)

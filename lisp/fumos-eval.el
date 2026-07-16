@@ -2,8 +2,11 @@
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
 (require 'cl-lib)
+(require 'compile)
+(require 'eldoc)
 (require 'subr-x)
 (require 'thingatpt)
+(require 'xref)
 (require 'fumos-repl)
 
 (declare-function lua-mode "lua-mode")
@@ -12,6 +15,145 @@
   "Return the current FUMOS connection."
   (or (fumos-repl-current-connection)
       (user-error "No FUMOS connection")))
+
+(cl-defstruct (fumos-source-authority
+               (:constructor fumos-source-authority--create))
+  connection process generation root-input root mod-id candidate file relative
+  virtual source-buffer)
+
+(cl-defstruct (fumos-locus-record
+               (:constructor fumos-locus-record--create))
+  authority line column column-unit token pinned-buffer request-marker)
+
+(cl-defstruct (fumos-request-context
+               (:constructor fumos-request-context--create))
+  connection process generation authority marker marker-line marker-column
+  marker-byte-column column-unit)
+
+(defun fumos-eval--valid-mod-id-p (value)
+  "Return non-nil when VALUE is exactly one safe mod path segment."
+  (and (stringp value)
+       (not (string-empty-p value))
+       (not (member value '("." "..")))
+       (not (string-match-p "[/\\\\\r\n\0]" value))))
+
+(defun fumos-eval--valid-relative-path-p (value)
+  "Return non-nil when VALUE is a strict project-relative Fennel path."
+  (and (stringp value)
+       (not (string-empty-p value))
+       (not (file-remote-p value))
+       (not (file-name-absolute-p value))
+       (not (string-match-p "[\\\\\r\n\0]" value))
+       (string-match-p "\\.fnlm?\\'" value)
+       (cl-every
+        (lambda (segment) (not (member segment '("" "." ".."))))
+        (split-string value "/" nil))))
+
+(defun fumos-eval--canonical-root (connection)
+  "Return CONNECTION's authenticated root input and canonical directory."
+  (let* ((instance (fumos-connection-instance connection))
+         (value (fumos-instance-project-root instance)))
+    (when (or (not (stringp value))
+              (file-remote-p value)
+              (not (file-name-absolute-p value)))
+      (user-error "FUMOS project root is not local and absolute"))
+    (let* ((input (file-name-as-directory (expand-file-name value)))
+           (canonical
+            (condition-case nil
+                (file-name-as-directory (file-truename input))
+              (error
+               (user-error "Cannot canonicalize FUMOS project root")))))
+      (list input canonical))))
+
+(defun fumos-eval--relative-from-wire (path mod-id)
+  "Return PATH relative to MOD-ID, rejecting every ambiguous spelling."
+  (when (or (not (stringp path))
+            (file-remote-p path)
+            (file-name-absolute-p path)
+            (string-match-p "[\\\\\r\n\0]" path))
+    (user-error "Invalid FUMOS wire source path"))
+  (let* ((mods-prefix "mods/")
+         (owned-prefix (format "mods/%s/" mod-id))
+         (relative
+          (cond
+           ((string-prefix-p owned-prefix path)
+            (substring path (length owned-prefix)))
+           ((string-prefix-p mods-prefix path)
+            (user-error "FUMOS source belongs to another mod"))
+           (t path))))
+    (unless (fumos-eval--valid-relative-path-p relative)
+      (user-error "Invalid FUMOS project-relative source path"))
+    relative))
+
+(defun fumos-eval--authority
+    (connection path &optional absolute-source source-buffer)
+  "Authenticate PATH for captured CONNECTION and return one authority.
+
+When ABSOLUTE-SOURCE is non-nil PATH must be a local absolute visited file.
+Otherwise PATH is an untrusted wire path."
+  (unless (fumos-connection-p connection)
+    (user-error "No FUMOS connection"))
+  (let* ((instance (fumos-connection-instance connection))
+         (mod-id (fumos-instance-mod-id instance)))
+    (unless (fumos-eval--valid-mod-id-p mod-id)
+      (user-error "FUMOS mod ID is not one path segment"))
+    (pcase-let* ((`(,root-input ,root)
+                   (fumos-eval--canonical-root connection))
+                  (candidate
+                   (if absolute-source
+                       (progn
+                         (when (or (not (stringp path))
+                                   (file-remote-p path)
+                                   (not (file-name-absolute-p path)))
+                           (user-error
+                            "FUMOS source must be a local absolute file"))
+                         (expand-file-name path))
+                     (expand-file-name
+                      (fumos-eval--relative-from-wire path mod-id) root)))
+                  (file
+                   (condition-case nil
+                       (file-truename candidate)
+                     (error
+                      (user-error "Cannot canonicalize FUMOS source file")))))
+      (unless (and (not (file-remote-p candidate))
+                   (file-in-directory-p file root)
+                   (string-match-p "\\.fnlm?\\'" file)
+                   (file-regular-p file))
+        (user-error "File is outside the attached FUMOS project"))
+      (let ((relative
+             (if absolute-source
+                 (file-relative-name file root)
+               (fumos-eval--relative-from-wire path mod-id))))
+        (unless (fumos-eval--valid-relative-path-p relative)
+          (user-error "Invalid FUMOS project-relative source path"))
+        (fumos-source-authority--create
+         :connection connection
+         :process (fumos-connection-process connection)
+         :generation (fumos-connection-generation connection)
+         :root-input root-input :root root :mod-id mod-id
+         :candidate candidate :file file :relative relative
+         :virtual (concat "mods/" mod-id "/" relative)
+         :source-buffer
+         (and (buffer-live-p source-buffer) source-buffer))))))
+
+(defun fumos-eval--wire-authority (connection path &optional context)
+  "Return a fail-closed authority for untrusted PATH, or nil."
+  (condition-case nil
+      (let* ((authority (fumos-eval--authority connection path))
+             (captured (and (fumos-request-context-p context)
+                            (fumos-request-context-authority context))))
+        (when (and (fumos-source-authority-p captured)
+                   (equal (fumos-source-authority-file authority)
+                          (fumos-source-authority-file captured)))
+          (setf (fumos-source-authority-source-buffer authority)
+                (fumos-source-authority-source-buffer captured)))
+        authority)
+    ((error quit) nil)))
+
+(defun fumos-eval--authority-current-file (connection)
+  "Return source authority for the current visited buffer."
+  (when buffer-file-name
+    (fumos-eval--authority connection buffer-file-name t (current-buffer))))
 
 (defun fumos-eval--validate-local-source-file ()
   "Reject a nonlocal or relative `buffer-file-name' without filesystem I/O."
@@ -26,54 +168,458 @@
   (when buffer-file-name
     (fumos-eval--validate-local-source-file)
     (let* ((connection (fumos-eval--connection))
-           (instance (fumos-connection-instance connection))
-           (root-value (fumos-instance-project-root instance))
-           (mod-id (fumos-instance-mod-id instance)))
-      (when (or (not (stringp root-value))
-                (file-remote-p root-value)
-                (not (file-name-absolute-p root-value)))
-        (user-error "FUMOS project root is not local and absolute"))
-      (unless (and (stringp mod-id)
-                   (not (string-empty-p mod-id))
-                   (not (member mod-id '("." "..")))
-                   (not (string-match-p "[/\\\\]" mod-id)))
-        (user-error "FUMOS mod ID is not one path segment"))
-      (let* ((root
+           (authority (fumos-eval--authority-current-file connection)))
+      (save-restriction
+        (widen)
+        (save-excursion
+          (goto-char position)
+          (let ((prefix
+                 (buffer-substring-no-properties
+                  (line-beginning-position) (point))))
+            (list
+             :file (fumos-source-authority-virtual authority)
+             :line (line-number-at-pos (point) t)
+             :column
+             (1+ (string-bytes
+                  (encode-coding-string prefix 'utf-8-unix)))
+             :authority authority)))))))
+
+(defun fumos-source-context-at-position (position)
+  "Return authenticated wire source context for buffer POSITION."
+  (fumos-eval--source position))
+
+(defun fumos-eval--authority-live-buffer (authority)
+  "Return AUTHORITY's matching live file buffer, if any."
+  (let ((source (fumos-source-authority-source-buffer authority))
+        (file (fumos-source-authority-file authority)))
+    (or
+     (and
+      (buffer-live-p source)
+      (with-current-buffer source
+        (and (stringp buffer-file-name)
+             (not (file-remote-p buffer-file-name))
              (condition-case nil
-                  (file-name-as-directory (file-truename root-value))
-                (error
-                 (user-error "Cannot canonicalize FUMOS project root"))))
-             (absolute
-              (condition-case nil
-                  (file-truename buffer-file-name)
-                (error
-                 (user-error "Cannot canonicalize FUMOS source file")))))
-        (unless (file-in-directory-p absolute root)
-          (user-error "File is outside the attached FUMOS project"))
-        (let ((relative (file-relative-name absolute root)))
-          (unless
-              (and (string-match-p "\\.fnlm?\\'" relative)
-                   (not (file-name-absolute-p relative))
-                   (not (string-search "\\" relative))
-                   (not (string-search "//" relative))
-                   (cl-every
-                    (lambda (segment)
-                      (not (member segment '("" "." ".."))))
-                    (split-string relative "/" nil)))
-            (user-error "Invalid FUMOS project-relative source path"))
-          (save-restriction
-            (widen)
-            (save-excursion
-              (goto-char position)
-              (let ((prefix
-                     (buffer-substring-no-properties
-                      (line-beginning-position) (point))))
-                (list
-                 :file (concat "mods/" mod-id "/" relative)
-                 :line (line-number-at-pos (point) t)
-                 :column
-                 (1+ (string-bytes
-                      (encode-coding-string prefix 'utf-8-unix))))))))))))
+                 (equal file (file-truename buffer-file-name))
+               (file-error nil))))
+      source)
+     (get-file-buffer file))))
+
+(defun fumos-eval--authority-revalidate (authority)
+  "Return AUTHORITY's canonical file while its filesystem identity is safe."
+  (condition-case nil
+      (let* ((root-input (fumos-source-authority-root-input authority))
+             (root (file-name-as-directory
+                    (file-truename root-input)))
+             (candidate (fumos-source-authority-candidate authority))
+             (file (file-truename candidate)))
+        (and (not (file-remote-p root-input))
+             (not (file-remote-p candidate))
+             (equal root (fumos-source-authority-root authority))
+             (equal file (fumos-source-authority-file authority))
+             (file-in-directory-p file root)
+             (string-match-p "\\.fnlm?\\'" file)
+             (file-regular-p file)
+             file))
+    ((error quit) nil)))
+
+(defun fumos-eval--line-string-from-live-buffer (buffer line)
+  "Return decoded LINE from widened live BUFFER, or nil."
+  (with-current-buffer buffer
+    (save-restriction
+      (widen)
+      (when (and (integerp line) (> line 0)
+                 (<= line (line-number-at-pos (point-max) t)))
+        (save-excursion
+          (goto-char (point-min))
+          (when (zerop (forward-line (1- line)))
+            (buffer-substring-no-properties
+             (line-beginning-position) (line-end-position))))))))
+
+(defun fumos-eval--strict-utf8-decode (bytes)
+  "Decode unibyte UTF-8 BYTES, rejecting truncated or malformed sequences."
+  (let ((decoded (decode-coding-string bytes 'utf-8-unix)))
+    (when (and (equal bytes (encode-coding-string decoded 'utf-8-unix))
+               (cl-every (lambda (character)
+                           (not (eq 'eight-bit (char-charset character))))
+                         (string-to-list decoded)))
+      decoded)))
+
+(defun fumos-eval--line-string-from-file (file line)
+  "Return strictly decoded UTF-8 LINE from FILE, or nil."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally file)
+    (when (and (integerp line) (> line 0)
+               (<= line (line-number-at-pos (point-max) t)))
+      (goto-char (point-min))
+      (when (zerop (forward-line (1- line)))
+        (fumos-eval--strict-utf8-decode
+         (buffer-substring-no-properties
+          (line-beginning-position) (line-end-position)))))))
+
+(defun fumos-eval--authority-line-string (authority line)
+  "Return AUTHORITY's current LINE, preferring a widened live buffer."
+  (when-let* ((file (fumos-eval--authority-revalidate authority)))
+    (if-let* ((buffer (fumos-eval--authority-live-buffer authority)))
+        (fumos-eval--line-string-from-live-buffer buffer line)
+      (fumos-eval--line-string-from-file file line))))
+
+(defun fumos-eval--character-column (line column unit)
+  "Convert one-based COLUMN in LINE from UNIT to a character column."
+  (when (and (stringp line) (integerp column) (> column 0))
+    (pcase unit
+      ('character
+       (let ((offset (1- column)))
+         (and (<= offset (length line)) offset)))
+      ('utf8-byte
+       (let* ((bytes (encode-coding-string line 'utf-8-unix))
+              (offset (1- column)))
+         (when (and (<= offset (length bytes))
+                    (or (= offset (length bytes))
+                        (let ((byte (aref bytes offset)))
+                          (not (<= #x80 byte #xBF)))))
+           (when-let* ((decoded
+                        (fumos-eval--strict-utf8-decode
+                         (substring bytes 0 offset))))
+             (length decoded))))))))
+
+(defun fumos-eval--context-matches-authority-p (context authority)
+  "Return non-nil when CONTEXT and AUTHORITY name the same source file."
+  (let ((captured (and (fumos-request-context-p context)
+                       (fumos-request-context-authority context))))
+    (and (fumos-source-authority-p captured)
+         (equal (fumos-source-authority-file captured)
+                (fumos-source-authority-file authority)))))
+
+(defun fumos-eval--adjust-request-locus
+    (context authority line column unit)
+  "Adjust LINE and COLUMN through CONTEXT's unique live request marker."
+  (let ((marker (and (fumos-request-context-p context)
+                     (fumos-request-context-marker context))))
+    (if (not (and (markerp marker)
+                  (marker-buffer marker)
+                  (marker-position marker)
+                  (fumos-eval--context-matches-authority-p context authority)))
+        (cons line column)
+      (with-current-buffer (marker-buffer marker)
+        (save-restriction
+          (widen)
+          (save-excursion
+            (goto-char marker)
+            (let* ((old-line (fumos-request-context-marker-line context))
+                   (current-line (line-number-at-pos (point) t))
+                   (adjusted-line (+ current-line (- line old-line)))
+                   (adjusted-column column))
+              (when (= line old-line)
+                (setq
+                 adjusted-column
+                 (+ column
+                    (-
+                     (pcase unit
+                       ('character
+                        (1+ (- (point) (line-beginning-position))))
+                       ('utf8-byte
+                        (1+ (string-bytes
+                             (encode-coding-string
+                              (buffer-substring-no-properties
+                               (line-beginning-position) (point))
+                              'utf-8-unix)))))
+                     (pcase unit
+                       ('character
+                        (fumos-request-context-marker-column context))
+                       ('utf8-byte
+                        (fumos-request-context-marker-byte-column context)))))))
+              (cons adjusted-line adjusted-column))))))))
+
+(defun fumos-eval--locus-record
+    (connection path line column unit &optional context)
+  "Return a validated locus record for untrusted wire location values."
+  (when (and (memq unit '(utf8-byte character))
+             (integerp line) (> line 0)
+             (integerp column) (> column 0))
+    (when-let* ((authority
+                 (fumos-eval--wire-authority connection path context)))
+      (pcase-let* ((`(,adjusted-line . ,adjusted-column)
+                     (fumos-eval--adjust-request-locus
+                      context authority line column unit))
+                    (line-string
+                     (fumos-eval--authority-line-string
+                      authority adjusted-line))
+                    (character-column
+                     (and line-string
+                          (fumos-eval--character-column
+                           line-string adjusted-column unit))))
+        (when (integerp character-column)
+          (fumos-locus-record--create
+           :authority authority :line adjusted-line
+           :column character-column :column-unit unit
+           :request-marker
+           (and (fumos-request-context-p context)
+                (fumos-request-context-marker context))))))))
+
+(defvar-local fumos-compilation--records nil
+  "Opaque locus ID to `fumos-locus-record' table in an error buffer.")
+
+(defvar-local fumos-compilation--tokens nil
+  "Opaque filename token to pinned locus record table.")
+
+(defvar-local fumos-compilation--owner nil
+  "Connection that owns the current historical error buffer.")
+
+(defvar-local fumos-compilation--generation nil
+  "Transport generation that created the current error buffer.")
+
+(defvar-local fumos-compilation--root nil
+  "Canonical project root that owns the current error buffer.")
+
+(defun fumos-compilation--matched-record ()
+  "Return the record named by the current regexp match, or nil."
+  (let ((id (match-string-no-properties 1)))
+    (save-match-data
+      (and (stringp id)
+           (hash-table-p fumos-compilation--records)
+           (gethash id fumos-compilation--records)))))
+
+(defun fumos-compilation--safe-open-buffer (record)
+  "Open RECORD's revalidated canonical file and return the exact buffer."
+  (let* ((authority (fumos-locus-record-authority record))
+         (file (fumos-eval--authority-revalidate authority)))
+    (when file
+      (condition-case nil
+          (let ((buffer
+                 (or (fumos-eval--authority-live-buffer authority)
+                     (find-file-noselect file))))
+            (when (and (buffer-live-p buffer)
+                       (with-current-buffer buffer
+                         (and (stringp buffer-file-name)
+                              (not (file-remote-p buffer-file-name))
+                              (equal file (file-truename buffer-file-name)))))
+              buffer))
+        ((error quit) nil)))))
+
+(defun fumos-compilation--file ()
+  "Return an opaque token only after parse-time authority revalidation."
+  (let ((id (match-string-no-properties 1)))
+    (when-let* ((record (fumos-compilation--matched-record)))
+    (save-match-data
+      (let ((buffer (fumos-locus-record-pinned-buffer record))
+            (token (fumos-locus-record-token record)))
+        (unless (buffer-live-p buffer)
+          (setq buffer (fumos-compilation--safe-open-buffer record))
+          (when buffer
+            (setq token
+                  (format "FUMOS-BUFFER-%s-%s"
+                          (substring
+                           (secure-hash 'sha256
+                                        (fumos-source-authority-file
+                                        (fumos-locus-record-authority record)))
+                           0 12)
+                          id))
+            (setf (fumos-locus-record-pinned-buffer record) buffer
+                  (fumos-locus-record-token record) token)
+            (puthash token record fumos-compilation--tokens)))
+        (and (buffer-live-p buffer) (stringp token) token))))))
+
+(defun fumos-compilation--line ()
+  "Return the authenticated line for the current internal locus."
+  (when-let* ((record (fumos-compilation--matched-record)))
+    (fumos-locus-record-line record)))
+
+(defun fumos-compilation--column ()
+  "Return the authenticated one-based character column for this locus."
+  (when-let* ((record (fumos-compilation--matched-record)))
+    (1+ (fumos-locus-record-column record))))
+
+(defun fumos-compilation--filename (token)
+  "Resolve only an opaque TOKEN to its already pinned live buffer."
+  (save-match-data
+    (let ((record (and (stringp token)
+                       (hash-table-p fumos-compilation--tokens)
+                       (gethash token fumos-compilation--tokens))))
+      (and (fumos-locus-record-p record)
+           (buffer-live-p (fumos-locus-record-pinned-buffer record))
+           (fumos-locus-record-pinned-buffer record)))))
+
+(defconst fumos-compilation-error-regexp-alist-alist
+  '((fumos-fennel "^FUMOS-LOC \\([0-9]+\\):"
+     fumos-compilation--file
+     fumos-compilation--line
+     fumos-compilation--column
+     2))
+  "Compilation regexp whose captures are only opaque FUMOS record IDs.")
+
+(define-compilation-mode fumos-compilation-mode "FUMOS Error"
+  "Compilation mode backed only by authenticated FUMOS locus records."
+  (setq-local compilation-error-regexp-alist '(fumos-fennel)
+              compilation-error-regexp-alist-alist
+              fumos-compilation-error-regexp-alist-alist
+              compilation-parse-errors-filename-function
+              #'fumos-compilation--filename
+              compilation-first-column 1
+              compilation-error-screen-columns nil)
+  (setq-local fumos-compilation--records (make-hash-table :test #'equal)
+              fumos-compilation--tokens (make-hash-table :test #'equal)))
+
+(defun fumos-eval--error-context (context)
+  "Normalize CONTEXT into a captured request context, or nil."
+  (cond
+   ((fumos-request-context-p context) context)
+   ((fumos-source-authority-p context)
+    (fumos-request-context--create
+     :connection (fumos-source-authority-connection context)
+     :process (fumos-source-authority-process context)
+     :generation (fumos-source-authority-generation context)
+     :authority context :column-unit 'utf8-byte))
+   ((and (listp context)
+         (fumos-source-authority-p (plist-get context :authority)))
+    (fumos-eval--error-context (plist-get context :authority)))
+   (t
+    (when-let* ((connection
+                 (or (and (boundp 'fumos-repl--source-owner)
+                          fumos-repl--source-owner)
+                     (and (boundp 'fumos-repl--connection)
+                          fumos-repl--connection))))
+      (fumos-request-context--create
+       :connection connection
+       :process (fumos-connection-process connection)
+       :generation (fumos-connection-generation connection)
+       :column-unit 'utf8-byte)))))
+
+(defun fumos-eval--error-context-current-p (context)
+  "Return non-nil while CONTEXT still owns its exact transport generation."
+  (and (fumos-request-context-p context)
+       (fumos-repl--owns-transport-p
+        (fumos-request-context-connection context)
+        (fumos-request-context-process context)
+        (fumos-request-context-generation context))))
+
+(defun fumos-eval--strip-known-error-prefix (line)
+  "Strip only FUMOS-known diagnostic prefixes from raw LINE."
+  (let ((value (string-trim-left line)))
+    (dolist (prefix '("Error compiling expression: "
+                      "Compile error: "
+                      "Runtime error: "))
+      (when (string-prefix-p prefix value)
+        (setq value (substring value (length prefix)))))
+    (string-remove-prefix "@" value)))
+
+(defun fumos-eval--raw-line-locus (connection raw unit context)
+  "Parse one RAW line into an authenticated record, or return nil."
+  (save-match-data
+    (unless (string-match-p "\\`[[:space:]]*FUMOS-LOC[[:space:]]" raw)
+      (let ((line (fumos-eval--strip-known-error-prefix raw)))
+        (when (string-match
+               "\\`\\(.+\\.fnlm?\\):\\([0-9]+\\):\\([0-9]+\\)\\(?:\\'\\|:.*\\|[[:space:]].*\\)"
+               line)
+          ;; Copy every capture before any filesystem helper can alter match data.
+          (let ((path (substring-no-properties (match-string 1 line)))
+                (line-number
+                 (string-to-number (match-string-no-properties 2 line)))
+                (column
+                 (string-to-number (match-string-no-properties 3 line))))
+            (fumos-eval--locus-record
+             connection path line-number column unit context)))))))
+
+(defun fumos-eval--error-buffer-name (connection)
+  "Return CONNECTION's generation-owned error buffer name."
+  (let* ((instance (fumos-connection-instance connection))
+         (root (fumos-instance-project-root instance)))
+    (format "*FUMOS Error: %s@%d %s g%d*"
+            (fumos-instance-mod-id instance)
+            (fumos-instance-pid instance)
+            (substring (secure-hash 'sha256 root) 0 8)
+            (fumos-connection-generation connection))))
+
+(defun fumos-error-handler (type message traceback &optional context)
+  "Display one generation-owned FUMOS error with authenticated locations."
+  (let* ((context (fumos-eval--error-context context))
+         (connection (and context
+                          (fumos-request-context-connection context))))
+    (when (and connection (fumos-eval--error-context-current-p context))
+      (let* ((buffer
+              (get-buffer-create (fumos-eval--error-buffer-name connection)))
+             (unit (or (fumos-request-context-column-unit context)
+                       'utf8-byte))
+             (raw-lines
+              (append (split-string (if (stringp message) message
+                                      (format "%s" message))
+                                    "\n" nil)
+                      (and traceback
+                           (split-string (if (stringp traceback) traceback
+                                           (format "%s" traceback))
+                                         "\n" nil))))
+             records)
+        (dolist (raw raw-lines)
+          (when-let* ((record
+                       (fumos-eval--raw-line-locus
+                        connection raw unit context)))
+            (push record records)))
+        (with-current-buffer buffer
+          (fumos-compilation-mode)
+          (setq-local fumos-compilation--owner connection
+                      fumos-compilation--generation
+                      (fumos-request-context-generation context)
+                      fumos-compilation--root
+                      (and (car records)
+                           (fumos-source-authority-root
+                            (fumos-locus-record-authority (car records)))))
+          (let ((inhibit-read-only t)
+                (id 0))
+            (erase-buffer)
+            (insert (format "%s error:\n" (capitalize (format "%s" type))))
+            (dolist (raw raw-lines)
+              (insert "FUMOS-RAW " raw "\n"))
+            (dolist (record (nreverse records))
+              (let ((key (number-to-string (cl-incf id))))
+                (puthash key record fumos-compilation--records)
+                (insert
+                 (format "FUMOS-LOC %s: %s:%d:%d\n"
+                         key
+                         (fumos-source-authority-virtual
+                          (fumos-locus-record-authority record))
+                         (fumos-locus-record-line record)
+                         (1+ (fumos-locus-record-column record))))))
+            (goto-char (point-min))))
+        (setf (fumos-connection-error-buffer connection) buffer)
+        (pcase fennel-proto-repl-error-buffer-action
+          ('jump (pop-to-buffer buffer))
+          ('show (display-buffer buffer)))
+        buffer))))
+
+(defun fumos-eval--owned-error-buffer ()
+  "Return only the error buffer owned by the current FUMOS context."
+  (cond
+   ((derived-mode-p 'fumos-compilation-mode)
+    (and (fumos-connection-p fumos-compilation--owner) (current-buffer)))
+   (t
+    (let* ((connection
+            (or (and (boundp 'fumos-repl--source-owner)
+                     fumos-repl--source-owner)
+                (and (boundp 'fumos-repl--connection)
+                     fumos-repl--connection)))
+           (buffer (and (fumos-connection-p connection)
+                        (fumos-connection-error-buffer connection))))
+      (and (buffer-live-p buffer)
+           (eq connection
+               (buffer-local-value 'fumos-compilation--owner buffer))
+           buffer)))))
+
+(defun fumos-eval--navigate-owned-error (count reset)
+  "Navigate COUNT errors in the current connection-owned buffer."
+  (let ((buffer (or (fumos-eval--owned-error-buffer)
+                    (user-error "No FUMOS error buffer for this connection"))))
+    (with-current-buffer buffer
+      (funcall next-error-function count reset))))
+
+(defun fumos-next-error (&optional count)
+  "Visit the next error owned by the current FUMOS connection."
+  (interactive "p")
+  (fumos-eval--navigate-owned-error (or count 1) nil))
+
+(defun fumos-previous-error (&optional count)
+  "Visit the previous error owned by the current FUMOS connection."
+  (interactive "p")
+  (fumos-eval--navigate-owned-error (- (or count 1)) nil))
 
 (defun fumos-eval--display (values &optional end buffer)
   "Display VALUES at END in BUFFER using the upstream result UI."
@@ -89,9 +635,61 @@
       (forward-comment (point-max))
       (not (eobp)))))
 
-(defun fumos-eval--marker-delivery (marker values-callback)
+(defun fumos-eval--request-context (source marker unit)
+  "Capture SOURCE, MARKER, and UNIT for one asynchronous request."
+  (let* ((authority (and (listp source) (plist-get source :authority)))
+         (connection
+          (if (fumos-source-authority-p authority)
+              (fumos-source-authority-connection authority)
+            (fumos-eval--connection)))
+         marker-line marker-column marker-byte-column)
+    (when (and (markerp marker) (marker-buffer marker))
+      (with-current-buffer (marker-buffer marker)
+        (save-restriction
+          (widen)
+          (save-excursion
+            (goto-char marker)
+            (setq marker-line (line-number-at-pos (point) t)
+                  marker-column
+                  (1+ (- (point) (line-beginning-position)))
+                  marker-byte-column
+                  (1+ (string-bytes
+                       (encode-coding-string
+                        (buffer-substring-no-properties
+                         (line-beginning-position) (point))
+                        'utf-8-unix))))))))
+    (fumos-request-context--create
+     :connection connection
+     :process (fumos-connection-process connection)
+     :generation (fumos-connection-generation connection)
+     :authority authority :marker marker :marker-line marker-line
+     :marker-column marker-column :marker-byte-column marker-byte-column
+     :column-unit unit)))
+
+(defun fumos-eval--connection-context
+    (connection &optional authority column-unit)
+  "Capture CONNECTION and optional AUTHORITY for an asynchronous error."
+  (fumos-request-context--create
+   :connection connection :process (fumos-connection-process connection)
+   :generation (fumos-connection-generation connection)
+   :authority authority :column-unit (or column-unit 'utf8-byte)))
+
+(defun fumos-eval--error-callback (connection &optional authority column-unit)
+  "Return an error callback owned by CONNECTION and AUTHORITY."
+  (let ((context
+         (fumos-eval--connection-context
+          connection authority column-unit)))
+    (lambda (type message traceback)
+      (let ((fumos-repl--error-context context))
+        (fumos-repl--default-error-handler type message traceback)))))
+
+(defun fumos-eval--marker-delivery
+    (marker values-callback &optional source column-unit)
   "Return callbacks and an exactly-once finalizer for MARKER."
-  (let (finished)
+  (let ((context
+         (fumos-eval--request-context
+          source marker (or column-unit 'utf8-byte)))
+        finished)
     (let ((finish
            (lambda ()
              (unless finished
@@ -113,7 +711,9 @@
         :error
         (lambda (type message traceback)
           (unwind-protect
-              (fumos-repl--default-error-handler type message traceback)
+              (let ((fumos-repl--error-context context))
+                (fumos-repl--default-error-handler
+                 type message traceback))
             (funcall finish))))
        finish))))
 
@@ -132,7 +732,8 @@
              marker
              (lambda (values buffer position)
                (let ((fennel-proto-repl-eval-overlay display-overlay))
-                 (fumos-eval--display values position buffer)))))
+                 (fumos-eval--display values position buffer)))
+             source 'utf8-byte))
            (callbacks (car delivery))
            (finish (cdr delivery))
            sent)
@@ -245,6 +846,7 @@
   "Evaluate the expression before point and insert its values."
   (interactive)
   (pcase-let* ((`(,beg . ,end-position) (fumos-eval--last-sexp-bounds))
+               (source (fumos-eval--source beg))
                (end (copy-marker end-position t))
                (delivery
                 (fumos-eval--marker-delivery
@@ -252,7 +854,8 @@
                  (lambda (values buffer position)
                    (with-current-buffer buffer
                      (goto-char position)
-                     (insert "\n" (string-join values "\t"))))))
+                     (insert "\n" (string-join values "\t"))))
+                 source 'utf8-byte))
                (callbacks (car delivery))
                (finish (cdr delivery))
                (sent nil))
@@ -260,7 +863,7 @@
         (prog1
             (fumos-repl-send-eval
              (buffer-substring-no-properties beg end)
-             (fumos-eval--source beg)
+             source
              callbacks)
           (setq sent t))
       (unless sent (funcall finish)))))
@@ -272,6 +875,749 @@
     (fumos-eval-region beg end)
     (goto-char end)
     (forward-comment (point-max))))
+
+(cl-defstruct (fumos-tool-query
+               (:constructor fumos-tool-query--create))
+  kind connection process generation repl-buffer source-buffer source-context
+  authority epoch request-id callback-identity marker window display-action
+  symbol point callback show-errors)
+
+(cl-defstruct (fumos-completion-query
+               (:constructor fumos-completion-query--create))
+  connection process generation repl-buffer source-buffer source-context key
+  prefix epoch request-id callback-identity candidates annotate)
+
+(cl-defstruct (fumos-completion-cache
+               (:constructor fumos-completion-cache--create))
+  generation candidates kinds)
+
+(defun fumos-eval--owned-connection ()
+  "Return the exact connection owning the current FUMOS editing buffer."
+  (or
+   (and (boundp 'fumos-repl--source-owner)
+        (fumos-connection-p fumos-repl--source-owner)
+        fumos-repl--source-owner)
+   (and (boundp 'fumos-repl--connection)
+        (bound-and-true-p fumos-repl-mode)
+        (fumos-connection-p fumos-repl--connection)
+        fumos-repl--connection)
+   (user-error "Current buffer is not owned by a FUMOS connection")))
+
+(defun fumos-eval--source-owned-p (connection source repl-buffer)
+  "Return non-nil when CONNECTION still owns SOURCE and REPL-BUFFER."
+  (and (buffer-live-p source)
+       (if (eq source repl-buffer)
+           (with-current-buffer source
+             (and (bound-and-true-p fumos-repl-mode)
+                  (eq fumos-repl--connection connection)))
+         (with-current-buffer source
+           (eq fumos-repl--source-owner connection)))))
+
+(defun fumos-eval--query-epoch (connection kind)
+  "Advance and return CONNECTION's epoch for query KIND."
+  (pcase kind
+    ('help
+     (setf (fumos-connection-help-epoch connection)
+           (1+ (or (fumos-connection-help-epoch connection) 0))))
+    ('xref
+     (setf (fumos-connection-xref-epoch connection)
+           (1+ (or (fumos-connection-xref-epoch connection) 0))))
+    ('eldoc
+     (setf (fumos-connection-eldoc-epoch connection)
+           (1+ (or (fumos-connection-eldoc-epoch connection) 0))))
+    (_ (error "Unknown FUMOS query kind: %S" kind))))
+
+(defun fumos-eval--query-current-epoch (connection kind)
+  "Return CONNECTION's current epoch for KIND."
+  (pcase kind
+    ('help (fumos-connection-help-epoch connection))
+    ('xref (fumos-connection-xref-epoch connection))
+    ('eldoc (fumos-connection-eldoc-epoch connection))))
+
+(defun fumos-eval--query-pending (connection kind)
+  "Return CONNECTION's pending query for KIND."
+  (pcase kind
+    ('help (fumos-connection-help-pending connection))
+    ('xref (fumos-connection-xref-pending connection))
+    ('eldoc (fumos-connection-eldoc-pending connection))))
+
+(defun fumos-eval--set-query-pending (connection kind value)
+  "Set CONNECTION's pending KIND query to VALUE."
+  (pcase kind
+    ('help (setf (fumos-connection-help-pending connection) value))
+    ('xref (setf (fumos-connection-xref-pending connection) value))
+    ('eldoc (setf (fumos-connection-eldoc-pending connection) value))))
+
+(defun fumos-eval--query-delivery-current-p (query)
+  "Return non-nil when QUERY owns its exact deferred callback delivery."
+  (let* ((connection (fumos-tool-query-connection query))
+         (id (fumos-tool-query-request-id query))
+         (delivery
+          (and (integerp id)
+               (gethash id
+                        (fumos-repl--callback-delivery-table connection)))))
+    (and (fumos-callback-delivery-p delivery)
+         (eq (fumos-tool-query-callback-identity query)
+             (fumos-callback-delivery-callbacks delivery)))))
+
+(defun fumos-eval--query-current-p (query)
+  "Validate every transport, source, epoch, and callback owner of QUERY."
+  (let ((connection (fumos-tool-query-connection query))
+        (kind (fumos-tool-query-kind query)))
+    (and (eq query (fumos-eval--query-pending connection kind))
+         (eql (fumos-tool-query-epoch query)
+              (fumos-eval--query-current-epoch connection kind))
+         (eq (fumos-tool-query-repl-buffer query)
+             (fumos-connection-repl-buffer connection))
+         (fumos-repl--owns-transport-p
+          connection (fumos-tool-query-process query)
+          (fumos-tool-query-generation query))
+         (fumos-eval--source-owned-p
+          connection (fumos-tool-query-source-buffer query)
+          (fumos-tool-query-repl-buffer query))
+         (fumos-eval--query-delivery-current-p query))))
+
+(defun fumos-eval--clear-query-if-current (query)
+  "Clear QUERY's pending slot without disturbing newer intent."
+  (let ((connection (fumos-tool-query-connection query))
+        (kind (fumos-tool-query-kind query)))
+    (when (eq query (fumos-eval--query-pending connection kind))
+      (fumos-eval--set-query-pending connection kind nil))))
+
+(defun fumos-eval--cancel-request (connection repl-buffer request-id)
+  "Rollback REQUEST-ID's callback ownership after a setup failure."
+  (when (and (integerp request-id) (buffer-live-p repl-buffer))
+    (with-current-buffer repl-buffer
+      (let ((delivery
+             (gethash request-id
+                      (fumos-repl--callback-delivery-table connection))))
+        (if (fumos-callback-delivery-p delivery)
+            (fumos-repl--rollback-callback-assignment
+             connection repl-buffer delivery request-id)
+          (when (hash-table-p fennel-proto-repl--message-callbacks)
+            (fennel-proto-repl--unassign-callbacks request-id)))))
+    (setf (fumos-connection-active-request-ids connection)
+          (delq request-id
+                (fumos-connection-active-request-ids connection)))))
+
+(defun fumos-eval--query-error-context (query)
+  "Return a captured error context for QUERY."
+  (fumos-eval--connection-context
+   (fumos-tool-query-connection query)
+   (fumos-tool-query-authority query) 'utf8-byte))
+
+(defun fumos-eval--query-values (query handler values)
+  "Deliver terminal VALUES to current QUERY through HANDLER."
+  (when (fumos-eval--query-current-p query)
+    (fumos-eval--clear-query-if-current query)
+    (funcall handler query values)))
+
+(defun fumos-eval--query-error (query type message traceback)
+  "Deliver one owned QUERY error, or discard it when it is stale."
+  (when (fumos-eval--query-current-p query)
+    (fumos-eval--clear-query-if-current query)
+    (unwind-protect
+        (when (fumos-tool-query-show-errors query)
+          (let ((fumos-repl--error-context
+                 (fumos-eval--query-error-context query)))
+            (fumos-repl--default-error-handler type message traceback)))
+      (fumos-eval--release-query-marker query))))
+
+(defun fumos-eval--query-print (query handler data)
+  "Deliver nonterminal print DATA to current QUERY through HANDLER."
+  (when (fumos-eval--query-current-p query)
+    (funcall handler query data)))
+
+(cl-defun fumos-eval--start-query
+    (kind op data values-handler
+          &key print-handler symbol point callback marker window
+          display-action show-errors)
+  "Start one fully asynchronous owned tooling query and return its ID."
+  (let* ((source-buffer (current-buffer))
+         (connection (fumos-eval--owned-connection))
+         (process (fumos-connection-process connection))
+         (generation (fumos-connection-generation connection))
+         (repl-buffer (fumos-connection-repl-buffer connection))
+         (source-context
+          (and buffer-file-name
+               (fumos-source-context-at-position (point))))
+         (authority (and source-context
+                         (plist-get source-context :authority)))
+         (epoch (fumos-eval--query-epoch connection kind))
+         (query
+          (fumos-tool-query--create
+           :kind kind :connection connection :process process
+           :generation generation :repl-buffer repl-buffer
+           :source-buffer source-buffer :source-context source-context
+           :authority authority :epoch epoch :symbol symbol :point point
+           :callback callback :marker marker :window window
+           :display-action display-action :show-errors show-errors))
+         request-id committed)
+    (when-let* ((previous (fumos-eval--query-pending connection kind)))
+      (when (fumos-tool-query-p previous)
+        (fumos-eval--release-query-marker previous)))
+    (fumos-eval--set-query-pending connection kind query)
+    (unwind-protect
+        (condition-case caught
+            (let ((fumos-repl--connection connection))
+              (setq
+               request-id
+               (if (eq op :eval)
+                   (fumos-repl-send-eval
+                    data source-context
+                    (list
+                     :values
+                     (lambda (values)
+                       (fumos-eval--query-values
+                        query values-handler values))
+                     :error
+                     (lambda (type message traceback)
+                       (fumos-eval--query-error
+                        query type message traceback))
+                     :print
+                     (if print-handler
+                         (lambda (value)
+                           (fumos-eval--query-print
+                            query print-handler value))
+                       #'ignore)))
+                 (fumos-repl-send-command
+                  op data
+                  (list
+                   :values
+                   (lambda (values)
+                     (fumos-eval--query-values
+                      query values-handler values))
+                   :error
+                   (lambda (type message traceback)
+                     (fumos-eval--query-error
+                      query type message traceback))
+                   :print
+                   (if print-handler
+                       (lambda (value)
+                         (fumos-eval--query-print
+                          query print-handler value))
+                     #'ignore)))))
+              (setf
+               (fumos-tool-query-request-id query) request-id
+               (fumos-tool-query-callback-identity query)
+               (and (buffer-live-p repl-buffer)
+                    (buffer-local-value
+                     'fennel-proto-repl--message-callbacks repl-buffer)
+                    (with-current-buffer repl-buffer
+                      (gethash request-id
+                               fennel-proto-repl--message-callbacks))))
+              (unless (fumos-eval--query-current-p query)
+                (error "FUMOS query ownership changed during setup"))
+              (setq committed t)
+              request-id)
+          ((error quit)
+           (signal (car caught) (cdr caught))))
+      (unless committed
+        (fumos-eval--cancel-request connection repl-buffer request-id)
+        (fumos-eval--clear-query-if-current query)
+        (when (markerp marker) (set-marker marker nil))))))
+
+(defun fumos-eval--print-to-query-repl (query string)
+  "Print STRING in QUERY's captured game REPL buffer."
+  (let ((repl-buffer (fumos-tool-query-repl-buffer query)))
+    (when (buffer-live-p repl-buffer)
+      (with-current-buffer repl-buffer
+        (fennel-proto-repl--print string)))))
+
+(defun fumos-eval--single-symbol (value prompt)
+  "Return VALUE or the symbol at point, otherwise prompt with PROMPT."
+  (let ((symbol (or value (thing-at-point 'symbol t))))
+    (unless (and (stringp symbol) (not (string-empty-p symbol)))
+      (user-error "%s requires a symbol" prompt))
+    (substring-no-properties symbol)))
+
+(defun fumos-macroexpand ()
+  "Asynchronously print the macroexpansion of the form at point."
+  (interactive)
+  (let ((form (thing-at-point 'sexp t)))
+    (unless (and (stringp form) (not (string-empty-p form)))
+      (user-error "FUMOS macroexpand requires a form"))
+    (fumos-eval--start-query
+     'help :eval (format "(macrodebug %s)" form) #'ignore
+     :print-handler
+     (lambda (query value)
+       (fumos-eval--print-to-query-repl
+        query (if (string-suffix-p "\n" value) value (concat value "\n"))))
+     :show-errors t)))
+
+(defun fumos-show-documentation (&optional symbol)
+  "Asynchronously show documentation for SYMBOL in the game REPL."
+  (interactive
+   (list (read-string "Documentation: " (thing-at-point 'symbol t))))
+  (setq symbol (fumos-eval--single-symbol symbol "Documentation"))
+  (fumos-eval--start-query
+   'help :doc symbol
+   (lambda (query values)
+     (when-let* ((value (and (consp values) (car values))))
+       (fumos-eval--print-to-query-repl
+        query (concat (string-trim-right value) "\n"))))
+   :symbol symbol :show-errors t))
+
+(defun fumos-eval--reserved-query
+    (symbol template-function multisym-template-function)
+  "Build SYMBOL metadata query with the reserved FUMOS module identity."
+  (let ((fennel-proto-repl-fennel-module-name
+         fumos-repl-fennel-module-name))
+    (fennel-proto-repl--generate-query-command
+     symbol (funcall template-function) (funcall multisym-template-function))))
+
+(defun fumos-show-arglist (&optional symbol)
+  "Asynchronously show SYMBOL's arglist in the game REPL."
+  (interactive (list (read-string "Arglist: " (thing-at-point 'symbol t))))
+  (setq symbol (fumos-eval--single-symbol symbol "Arglist"))
+  (fumos-eval--start-query
+   'help :eval
+   (fumos-eval--reserved-query
+    symbol #'fennel-proto-repl--arglist-query-template
+    #'fennel-proto-repl--multisym-arglist-query-template)
+   (lambda (query values)
+     (let* ((wire (and (consp values) (car values)))
+            (parsed
+             (and (stringp wire)
+                  (condition-case nil
+                      (car (read-from-string wire))
+                    (error nil)))))
+       (when (vectorp parsed)
+         (fumos-eval--print-to-query-repl
+          query
+          (format "Arglist for %s: [%s]\n"
+                  symbol
+                  (mapconcat (lambda (value) (format "%s" value))
+                             (append parsed nil) " "))))))
+   :symbol symbol :show-errors t))
+
+(defun fumos-apropos (&optional pattern)
+  "Asynchronously show every symbol matching PATTERN in the game REPL."
+  (interactive (list (read-string "Apropos: " (thing-at-point 'symbol t))))
+  (unless (and (stringp pattern) (not (string-empty-p pattern)))
+    (user-error "Apropos requires a pattern"))
+  (fumos-eval--start-query
+   'help :apropos pattern
+   (lambda (query values)
+     (dolist (value values)
+       (when (stringp value)
+         (fumos-eval--print-to-query-repl
+          query (concat (string-trim-right value) "\n")))))
+   :show-errors t))
+
+(defun fumos-eval--find-record (query locus)
+  "Validate one real proto find LOCUS for QUERY."
+  (save-match-data
+    (when (and (stringp locus)
+               (string-match
+                "\\`@?\\(.+\\.fnlm?\\):\\([0-9]+\\)\\(?::\\([0-9]+\\)\\)?\\'"
+                locus))
+      (let ((path (substring-no-properties (match-string 1 locus)))
+            (line (string-to-number (match-string-no-properties 2 locus)))
+            (column
+             (if (match-beginning 3)
+                 (string-to-number (match-string-no-properties 3 locus))
+               1)))
+        (fumos-eval--locus-record
+         (fumos-tool-query-connection query) path line column 'utf8-byte
+         (fumos-eval--connection-context
+          (fumos-tool-query-connection query)
+          (fumos-tool-query-authority query) 'utf8-byte))))))
+
+(defun fumos-eval--record-xref (record summary)
+  "Return a pinned buffer xref for RECORD and SUMMARY, or nil."
+  (when-let* ((buffer (fumos-compilation--safe-open-buffer record)))
+    (setf (fumos-locus-record-pinned-buffer record) buffer)
+    (with-current-buffer buffer
+      (save-restriction
+        (widen)
+        (save-excursion
+          (goto-char (point-min))
+          (forward-line (1- (fumos-locus-record-line record)))
+          (forward-char (fumos-locus-record-column record))
+          (xref-make summary
+                     (xref-make-buffer-location buffer (point))))))))
+
+(defun fumos-eval--release-query-marker (query)
+  "Release QUERY's temporary origin marker."
+  (when-let* ((marker (fumos-tool-query-marker query)))
+    (when (markerp marker) (set-marker marker nil))))
+
+(defun fumos-eval--display-definition-xrefs (query xrefs)
+  "Display immutable XREFS with the public definition UX for QUERY."
+  (let ((marker (fumos-tool-query-marker query))
+        (window (fumos-tool-query-window query)))
+    (if (not (and (markerp marker) (marker-buffer marker)
+                  (window-live-p window)))
+        (fumos-eval--release-query-marker query)
+      (let* ((immutable (copy-sequence xrefs))
+             (fetcher (lambda () immutable))
+             (alist
+              `((window . ,window)
+                (display-action . ,(fumos-tool-query-display-action query))
+                (auto-jump . ,xref-auto-jump-to-first-definition))))
+        (unwind-protect
+            (with-selected-window window
+              (xref-push-marker-stack (copy-marker marker))
+              (funcall xref-show-definitions-function fetcher alist))
+          (fumos-eval--release-query-marker query))))))
+
+(defun fumos-eval--find-values (query values)
+  "Validate and display real proto find VALUES for QUERY."
+  (cond
+   ((null values)
+    (fumos-eval--release-query-marker query)
+    (message "No definition found for %s" (fumos-tool-query-symbol query)))
+   ((not (and (consp values) (null (cdr values))
+              (stringp (car values))))
+    (fumos-eval--release-query-marker query)
+    (fumos-error-handler
+     "find" "FUMOS find returned an invalid result" nil
+     (fumos-eval--query-error-context query)))
+   (t
+    (let* ((record (fumos-eval--find-record query (car values)))
+           (xref (and record
+                      (fumos-eval--record-xref
+                       record (fumos-tool-query-symbol query)))))
+      (if (not xref)
+          (progn
+            (fumos-eval--release-query-marker query)
+            (fumos-error-handler
+             "find" "FUMOS find returned an unsafe locus" nil
+             (fumos-eval--query-error-context query)))
+        (puthash
+         (fumos-tool-query-symbol query)
+         (list :generation (fumos-tool-query-generation query)
+               :xrefs (list xref))
+         (fumos-connection-xref-cache
+          (fumos-tool-query-connection query)))
+        (fumos-eval--display-definition-xrefs query (list xref)))))))
+
+(defun fumos-eval--find-definition (symbol display-action)
+  "Start an asynchronous definition lookup using DISPLAY-ACTION."
+  (setq symbol (fumos-eval--single-symbol symbol "Find definition"))
+  (fumos-eval--start-query
+   'xref :find symbol #'fumos-eval--find-values
+   :symbol symbol :marker (point-marker) :window (selected-window)
+   :display-action display-action :show-errors t))
+
+(defun fumos-find-definition (&optional symbol)
+  "Asynchronously find SYMBOL using the standard definition UX."
+  (interactive)
+  (fumos-eval--find-definition symbol nil))
+
+(defun fumos-find-definition-other-window (&optional symbol)
+  "Asynchronously find SYMBOL and display it in another window."
+  (interactive)
+  (fumos-eval--find-definition symbol 'window))
+
+(defun fumos-repl--xref-backend ()
+  "Return the cache-only FUMOS xref backend in an owned editing buffer."
+  (condition-case nil
+      (progn (fumos-eval--owned-connection) 'fumos)
+    (user-error nil)))
+
+(cl-defmethod xref-backend-identifier-at-point ((_ (eql fumos)))
+  "Return a plain Fennel identifier at point."
+  (when-let* ((symbol (thing-at-point 'symbol t)))
+    (unless (string-prefix-p ":" symbol)
+      (car (fennel-proto-repl--method-to-sym symbol)))))
+
+(cl-defmethod xref-backend-definitions ((_ (eql fumos)) symbol)
+  "Return only the current generation's already committed SYMBOL cache."
+  (condition-case nil
+      (let* ((connection (fumos-eval--owned-connection))
+             (entry (gethash symbol (fumos-connection-xref-cache connection))))
+        (when (eql (plist-get entry :generation)
+                   (fumos-connection-generation connection))
+          (copy-sequence (plist-get entry :xrefs))))
+    (user-error nil)))
+
+(cl-defmethod xref-backend-identifier-completion-table ((_ (eql fumos)))
+  nil)
+
+(defun fumos-eldoc-function (callback &rest _ignored)
+  "Asynchronously query Eldoc and call CALLBACK only for current point."
+  (let* ((point (point))
+         (fn-info (fennel-proto-repl--eldoc-fn-in-current-sexp))
+         (symbol
+          (or (and fn-info (substring-no-properties (car fn-info)))
+              (thing-at-point 'symbol t))))
+    (when (and (stringp symbol) (not (string-empty-p symbol)))
+      (condition-case nil
+          (progn
+            (fumos-eval--start-query
+             'eldoc :eval
+             (if fn-info
+                 (fumos-eval--reserved-query
+                  symbol #'fennel-proto-repl--arglist-query-template
+                  #'fennel-proto-repl--multisym-arglist-query-template)
+               (fumos-eval--reserved-query
+                symbol #'fennel-proto-repl--doc-query-template
+                #'fennel-proto-repl--multisym-doc-query-template))
+             (lambda (query values)
+               (let ((buffer (fumos-tool-query-source-buffer query)))
+                 (when (and (buffer-live-p buffer)
+                            (with-current-buffer buffer
+                              (and (= (point) (fumos-tool-query-point query))
+                                   (equal
+                                    (thing-at-point 'symbol t)
+                                    (fumos-tool-query-symbol query)))))
+                   (if fn-info
+                       (fennel-proto-repl--eldoc-fn-handler
+                        values callback symbol fn-info)
+                     (fennel-proto-repl--eldoc-var-handler
+                      values callback symbol)))))
+             :symbol symbol :point point :callback callback)
+            t)
+        ((error quit) nil)))))
+
+(defun fumos-eval--completion-query-current-p (query)
+  "Validate every owner identity captured by completion QUERY."
+  (let* ((connection (fumos-completion-query-connection query))
+         (id (fumos-completion-query-request-id query))
+         (delivery
+          (and (integerp id)
+               (gethash id
+                        (fumos-repl--callback-delivery-table connection)))))
+    (and
+     (eq query
+         (gethash (fumos-completion-query-key query)
+                  (fumos-connection-completion-pending connection)))
+     (eq (fumos-completion-query-repl-buffer query)
+         (fumos-connection-repl-buffer connection))
+     (fumos-repl--owns-transport-p
+      connection (fumos-completion-query-process query)
+      (fumos-completion-query-generation query))
+     (fumos-eval--source-owned-p
+      connection (fumos-completion-query-source-buffer query)
+      (fumos-completion-query-repl-buffer query))
+     (fumos-callback-delivery-p delivery)
+     (eq (fumos-completion-query-callback-identity query)
+         (fumos-callback-delivery-callbacks delivery)))))
+
+(defun fumos-eval--clear-completion-query (query)
+  "Clear completion QUERY without disturbing newer work for its key."
+  (let* ((connection (fumos-completion-query-connection query))
+         (table (fumos-connection-completion-pending connection))
+         (key (fumos-completion-query-key query)))
+    (when (eq query (gethash key table))
+      (remhash key table))))
+
+(defun fumos-eval--completion-wire-kinds (value candidates)
+  "Parse VALUE into an immutable candidate kind alist."
+  (when (stringp value)
+    (condition-case nil
+        (let* ((read-result (read-from-string value))
+               (parsed (car read-result)))
+          (when (and (vectorp parsed)
+                     (= (length parsed) (length candidates))
+                     (seq-every-p #'stringp parsed)
+                     (string-match-p
+                      "\\`[[:space:]]*\\'"
+                      (substring value (cdr read-result))))
+            (cl-mapcar #'cons candidates (append parsed nil))))
+      (error nil))))
+
+(defun fumos-eval--commit-completion (query candidates kinds)
+  "Commit CANDIDATES and KINDS when completion QUERY still owns its key."
+  (when (fumos-eval--completion-query-current-p query)
+    (puthash
+     (fumos-completion-query-key query)
+     (fumos-completion-cache--create
+      :generation (fumos-completion-query-generation query)
+      :candidates (copy-sequence candidates) :kinds (copy-tree kinds))
+     (fumos-connection-completion-cache
+      (fumos-completion-query-connection query)))
+    (fumos-eval--clear-completion-query query)))
+
+(defun fumos-eval--completion-kinds-values (query values)
+  "Commit a kind-annotated completion QUERY from terminal VALUES."
+  (when (fumos-eval--completion-query-current-p query)
+    (let ((kinds
+           (and (consp values) (null (cdr values))
+                (fumos-eval--completion-wire-kinds
+                 (car values) (fumos-completion-query-candidates query)))))
+      (if kinds
+          (fumos-eval--commit-completion
+           query (fumos-completion-query-candidates query) kinds)
+        (fumos-eval--clear-completion-query query)))))
+
+(defun fumos-eval--completion-send-kinds (query candidates)
+  "Start QUERY's optional asynchronous kind request for CANDIDATES."
+  (let* ((connection (fumos-completion-query-connection query))
+         (repl-buffer (fumos-completion-query-repl-buffer query))
+         (source-buffer (fumos-completion-query-source-buffer query))
+         (command
+          (fennel-proto-repl--minify-body
+           (format
+            fennel-proto-repl--symbol-types
+            (mapconcat
+             (lambda (candidate) (format "(symbol-type %S)" candidate))
+             candidates " "))
+           t))
+         request-id committed)
+    ;; The values callback that reached this point has already validated the
+    ;; first request.  Replace only this key with a new callback identity.
+    (setf (fumos-completion-query-candidates query) candidates
+          (fumos-completion-query-request-id query) nil
+          (fumos-completion-query-callback-identity query) nil)
+    (unwind-protect
+        (condition-case nil
+            (with-current-buffer source-buffer
+              (let ((fumos-repl--connection connection))
+                (setq request-id
+                      (fumos-repl-send-eval
+                       command (fumos-completion-query-source-context query)
+                       (list
+                        :values
+                        (lambda (values)
+                          (fumos-eval--completion-kinds-values query values))
+                        :error
+                        (lambda (&rest _)
+                          (when (fumos-eval--completion-query-current-p query)
+                            (fumos-eval--clear-completion-query query)))
+                        :print #'ignore)))
+                (setf
+                 (fumos-completion-query-request-id query) request-id
+                 (fumos-completion-query-callback-identity query)
+                 (with-current-buffer repl-buffer
+                   (gethash request-id fennel-proto-repl--message-callbacks)))
+                (unless (fumos-eval--completion-query-current-p query)
+                  (error "FUMOS completion kind ownership changed"))
+                (setq committed t)))
+          ((error quit) nil))
+      (unless committed
+        (fumos-eval--cancel-request connection repl-buffer request-id)
+        (fumos-eval--clear-completion-query query)))))
+
+(defun fumos-eval--completion-values (query values)
+  "Validate completion VALUES and commit or request optional kinds."
+  (when (fumos-eval--completion-query-current-p query)
+    (if (not (and (proper-list-p values) (seq-every-p #'stringp values)))
+        (fumos-eval--clear-completion-query query)
+      (let ((candidates (delete-dups (copy-sequence values))))
+        (if (and (fumos-completion-query-annotate query) candidates)
+            (fumos-eval--completion-send-kinds query candidates)
+          (fumos-eval--commit-completion query candidates nil))))))
+
+(defun fumos-eval--refresh-completion (connection source prefix source-context)
+  "Start a nonblocking completion refresh for SOURCE and PREFIX."
+  (let* ((process (fumos-connection-process connection))
+         (generation (fumos-connection-generation connection))
+         (repl-buffer (fumos-connection-repl-buffer connection))
+         (key (cons source prefix))
+         (pending (fumos-connection-completion-pending connection)))
+    (unless (gethash key pending)
+      (let* ((epoch
+              (setf (fumos-connection-completion-epoch connection)
+                    (1+ (or (fumos-connection-completion-epoch connection) 0))))
+             (query
+              (fumos-completion-query--create
+               :connection connection :process process :generation generation
+               :repl-buffer repl-buffer :source-buffer source
+               :source-context source-context :key key :prefix prefix
+               :epoch epoch :annotate fennel-proto-repl-annotate-completion))
+             request-id committed)
+        (puthash key query pending)
+        (unwind-protect
+            (condition-case nil
+                (let ((fumos-repl--connection connection))
+                  (setq request-id
+                        (fumos-repl-send-command
+                         :complete prefix
+                         (list
+                          :values
+                          (lambda (values)
+                            (fumos-eval--completion-values query values))
+                          :error
+                          (lambda (&rest _)
+                            (when (fumos-eval--completion-query-current-p query)
+                              (fumos-eval--clear-completion-query query)))
+                          :print #'ignore)))
+                  (setf
+                   (fumos-completion-query-request-id query) request-id
+                   (fumos-completion-query-callback-identity query)
+                   (with-current-buffer repl-buffer
+                     (gethash request-id fennel-proto-repl--message-callbacks)))
+                  (unless (fumos-eval--completion-query-current-p query)
+                    (error "FUMOS completion ownership changed"))
+                  (setq committed t))
+              ((error quit) nil))
+          (unless committed
+            (fumos-eval--cancel-request connection repl-buffer request-id)
+            (fumos-eval--clear-completion-query query)))))))
+
+(defun fumos-eval--completion-kind (kinds item)
+  "Return completion kind symbol for ITEM from immutable KINDS."
+  (pcase (cdr (assoc-string item kinds))
+    ("function" 'function) ("table" 'module) ("special" 'keyword)
+    ("macro" 'macro) ("number" 'constant) ("boolean" 'boolean)
+    ("string" 'string)
+    (_ (if (string-match-p "\\." item) 'field 'variable))))
+
+(defun fumos-eval--completion-annotation (kinds item)
+  "Return a textual annotation for ITEM using KINDS."
+  (let ((kind (fumos-eval--completion-kind kinds item)))
+    (cond ((eq kind 'module) " table")
+          ((eq kind 'variable) " definition")
+          (kind (format " %s" kind))
+          (t ""))))
+
+(defun fumos-completion-at-point ()
+  "Return current-generation cached completions and refresh asynchronously."
+  (when-let* ((bounds (bounds-of-thing-at-point 'symbol)))
+    (let* ((source (current-buffer))
+           (connection (fumos-eval--owned-connection))
+           (start (car bounds)) (end (cdr bounds))
+           (prefix (buffer-substring-no-properties start end))
+           (source-context
+            (and buffer-file-name
+                 (fumos-source-context-at-position (point))))
+           (key (cons source prefix))
+           (cache (gethash key
+                           (fumos-connection-completion-cache connection))))
+      (fumos-eval--refresh-completion
+       connection source prefix source-context)
+      (when (and (fumos-completion-cache-p cache)
+                 (eql (fumos-completion-cache-generation cache)
+                      (fumos-connection-generation connection)))
+        (let ((candidates
+               (copy-sequence (fumos-completion-cache-candidates cache)))
+              (kinds (copy-tree (fumos-completion-cache-kinds cache))))
+          (list start end candidates
+                :annotation-function
+                (apply-partially #'fumos-eval--completion-annotation kinds)
+                :company-kind
+                (apply-partially #'fumos-eval--completion-kind kinds)))))))
+
+(defun fumos-eval--release-tooling-markers (connection)
+  "Release temporary origin markers owned by CONNECTION's pending tooling."
+  (dolist (query (list (fumos-connection-help-pending connection)
+                       (fumos-connection-xref-pending connection)
+                       (fumos-connection-eldoc-pending connection)))
+    (when (fumos-tool-query-p query)
+      (fumos-eval--release-query-marker query))))
+
+(defun fumos-eval--invalidate-source-tooling (connection _source)
+  "Invalidate pending source tooling before CONNECTION ownership changes."
+  (fumos-eval--release-tooling-markers connection)
+  (setf (fumos-connection-help-epoch connection)
+        (1+ (or (fumos-connection-help-epoch connection) 0))
+        (fumos-connection-help-pending connection) nil
+        (fumos-connection-xref-epoch connection)
+        (1+ (or (fumos-connection-xref-epoch connection) 0))
+        (fumos-connection-xref-pending connection) nil
+        (fumos-connection-eldoc-epoch connection)
+        (1+ (or (fumos-connection-eldoc-epoch connection) 0))
+        (fumos-connection-eldoc-pending connection) nil
+        (fumos-connection-completion-epoch connection)
+        (1+ (or (fumos-connection-completion-epoch connection) 0)))
+  (dolist (table (list (fumos-connection-xref-cache connection)
+                       (fumos-connection-completion-pending connection)
+                       (fumos-connection-completion-cache connection)))
+    (when (hash-table-p table)
+      (clrhash table))))
 
 (defconst fumos-eval--tooling-guard
   "(assert (= _G _G._G) \"FUMOS tooling requires unshadowed _G\")"
@@ -345,7 +1691,9 @@
         (lambda (values)
           (fumos-eval--refresh-after-success
            connection process generation values t))
-        :error #'fumos-repl--default-error-handler)))))
+        :error
+        (fumos-eval--error-callback
+         connection (plist-get source :authority) 'utf8-byte))))))
 
 (defun fumos-reload-module (module)
   "Reload Fennel MODULE through the native Session command."
@@ -362,7 +1710,7 @@
       (lambda (values)
         (fumos-eval--refresh-after-success
          connection process generation values))
-      :error #'fumos-repl--default-error-handler))))
+      :error (fumos-eval--error-callback connection)))))
 
 (defvar fumos-eval--last-generated-lua nil
   "Last Lua source returned by an explicit compile preview.")
@@ -406,9 +1754,9 @@
       (let* ((wire-line (string-to-number (match-string 1 message)))
              (wire-column (string-to-number (match-string 2 message)))
              (suffix (substring message (match-end 0))))
-        (if (< wire-line 3)
+        (if (< wire-line 2)
             message
-          (let* ((source-line (- wire-line 2))
+          (let* ((source-line (1- wire-line))
                  (absolute-line (+ source-start-line source-line -1))
                  (absolute-column
                   (if (= source-line 1)
@@ -423,16 +1771,20 @@
     (connection process generation source source-start-line
                 source-start-column)
   "Return an identity-gated source-aware compile error callback."
-  (lambda (type message traceback)
-    (let ((compilation-error-screen-columns nil))
-      (fumos-repl--default-error-handler
-       type
-       (if (fumos-repl--owns-transport-p
-            connection process generation)
-           (fumos-eval--remap-compile-message
-            message source source-start-line source-start-column)
-         message)
-       traceback))))
+  (let ((context
+         (fumos-eval--connection-context
+          connection (plist-get source :authority) 'character)))
+    (lambda (type message traceback)
+      (let ((compilation-error-screen-columns nil)
+            (fumos-repl--error-context context))
+        (fumos-repl--default-error-handler
+         type
+         (if (fumos-repl--owns-transport-p
+              connection process generation)
+             (fumos-eval--remap-compile-message
+              message source source-start-line source-start-column)
+           message)
+         traceback)))))
 
 (defun fumos-eval--compile-region (beg end)
   "Compile BEG through END as one wrapped unit without executing it."
@@ -643,7 +1995,9 @@
                  (format
                   (concat "(do\n"
                           "  %s\n"
-                          "  (_G.Kristal.quickReload %S))")
+                          "  (let [(ok err) "
+                          "(_G.Mod.libs.fumos.requestGameReload %S)]\n"
+                          "    (if ok ok (error err))))")
                   fumos-eval--tooling-guard mode)
                  nil
                  (list :values #'ignore

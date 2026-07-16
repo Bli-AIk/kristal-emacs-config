@@ -2075,10 +2075,20 @@
                                minor-mode-overriding-map-alist))))
         (should (eq (fumos-connection-repl-buffer connection)
                     fennel-proto-repl--buffer))
-        (should (memq #'fennel-proto-repl-complete
+        (should (memq #'fumos-completion-at-point
                       completion-at-point-functions))
-        (should (memq #'fennel-proto-repl--xref-backend
+        (should-not (memq #'fennel-proto-repl-complete
+                          completion-at-point-functions))
+        (should (memq #'fumos-repl--xref-backend
                       xref-backend-functions))
+        (should-not (memq #'fennel-proto-repl--xref-backend
+                          xref-backend-functions))
+        (should (memq #'fumos-eldoc-function
+                      eldoc-documentation-functions))
+        (should-not (memq #'fennel-proto-repl-eldoc-fn-docstring
+                          eldoc-documentation-functions))
+        (should-not (memq #'fennel-proto-repl-eldoc-var-docstring
+                          eldoc-documentation-functions))
         (dolist (binding '(("C-x C-e" . fumos-eval-last-sexp)
                            ("C-M-x" . fumos-eval-defun)
                            ("C-c C-r" . fumos-eval-region)
@@ -2136,9 +2146,8 @@
       (before after connection server)
     (let (observed-after-cleanup)
       (with-current-buffer after
-        ;; Simulate the Task 11 backend already being installed and retain an
-        ;; unrelated local backend to prove cleanup is ownership-scoped.
-        (add-hook 'xref-backend-functions #'fumos-repl--xref-backend nil t)
+        ;; Mutations made while FUMOS owns the editing transaction are replaced
+        ;; by the exact pre-FUMOS snapshot during kill cleanup.
         (add-hook 'xref-backend-functions #'ignore t t)
         (add-hook
          'kill-buffer-hook
@@ -2159,7 +2168,7 @@
       (should observed-after-cleanup)
       (should-not (nth 0 observed-after-cleanup))
       (should-not (nth 1 observed-after-cleanup))
-      (should (nth 2 observed-after-cleanup))
+      (should-not (nth 2 observed-after-cleanup))
       (should-not (nth 3 observed-after-cleanup))
       (should-not (nth 4 observed-after-cleanup))
       (should-not (nth 5 observed-after-cleanup))
@@ -2232,7 +2241,9 @@
                            'fennel-proto-repl-fennel-module-name))
               (should (eq ordinary-repl fennel-proto-repl--buffer))
               (should fennel-proto-repl-minor-mode)
-              (should
+              (should (memq #'fennel--xref-backend
+                            xref-backend-functions))
+              (should-not
                (memq #'fennel-proto-repl--xref-backend
                      xref-backend-functions))
               (should-not
@@ -3182,13 +3193,14 @@
                  (proper-list-p request)
                  (cl-evenp (length request))
                  (integerp (plist-get request :id))
-                 (or (plist-member request :reload)
-                     (plist-member request :compile)))
+                 (seq-some
+                  (lambda (op) (plist-member request op))
+                  '(:reload :compile :complete :doc :apropos :find)))
       (ert-fail (format "Malformed command request: %S" line)))
     request))
 
 (defun fumos-test-command-request-p (line)
-  "Return non-nil when LINE is a reload or compile command map."
+  "Return non-nil when LINE is a supported FUMOS command map."
   (condition-case nil
       (progn (fumos-test-read-command-request line) t)
     (error nil)))
@@ -3202,7 +3214,11 @@
   "Send one real command values terminal and done for LINE."
   (let* ((request (fumos-test-read-command-request line))
          (id (plist-get request :id))
-         (op (if (plist-member request :reload) "reload" "compile")))
+         (op
+          (seq-find (lambda (name)
+                      (plist-member request (intern (concat ":" name))))
+                    '("reload" "compile" "complete" "doc"
+                      "apropos" "find"))))
     (fumos-test-server-send
      server
      (format
