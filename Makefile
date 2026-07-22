@@ -11,7 +11,7 @@ VANILLA_TESTS = \
 TESTS ?= $(VANILLA_TESTS)
 LOAD_PATH = -L vendor/fennel-mode -L lisp -L test
 
-.PHONY: test test-upstream test-doom test-installer testall clean
+.PHONY: test test-upstream test-doom test-installer test-launcher testall clean
 
 test:
 	$(EMACS) -Q --batch $(LOAD_PATH) -l test/test-helper.el \
@@ -27,7 +27,10 @@ test-doom:
 test-installer:
 	sh test/install-fennel-ls-test.sh
 
-testall: test test-upstream test-doom test-installer
+test-launcher:
+	sh test/run-kristal-terminal-test.sh
+
+testall: test test-upstream test-doom test-installer test-launcher
 
 clean:
 	find lisp test -name '*.elc' -delete 2>/dev/null || true

@@ -106,11 +106,15 @@ From the mod root:
 ```sh
 sh .emacs/run-kristal-terminal.sh
 sh .emacs/run-kristal-terminal.sh --hold
+sh .emacs/run-kristal-terminal.sh --foreground
 ```
 
 When launched from kitty or xterm, the script opens a separate terminal. In a
 GUI or non-terminal environment it runs LÖVE in the current process so Emacs
-can show its output.
+can show its output. `--hold` keeps an opened terminal available after LÖVE
+exits. `--foreground` always bypasses terminal detection and replaces the
+launcher process with LÖVE; it is intended for Emacs and other process
+supervisors. `--hold` and `--foreground` are mutually exclusive.
 
 The in-game FUMOS service is automatically available only when
 `Mod.info.dev == true`. It binds a random port on `127.0.0.1`; it is not a
@@ -135,14 +139,17 @@ stdin-based Fennel REPL:
   choice when needed.
 - `M-x fumos-attach` is the explicit instance-selection operation.
 - `M-x fumos-connect-or-switch` connects when needed and otherwise displays
-  the attached game REPL, whether it is ready or currently busy.
+  the attached game REPL, whether it is ready or currently busy. In Doom,
+  `SPC m '` also starts Kristal on demand when the project has no running
+  instance, then connects and displays the REPL as one operation; no second
+  key press is needed after startup.
 - `M-x fumos-reconnect` reconnects only to the previously attached PID. Use
   `fumos-attach` to choose a different process.
 
 A typical Doom session is:
 
 ```text
-M-x fumos-connect
+SPC m '
 SPC m e e
 SPC m c c
 SPC m r i
@@ -181,7 +188,7 @@ current buffer:
 
 ### Doom localleader bindings
 
-The source-buffer menu contains exactly 33 bindings. Normal, visual, and
+The source-buffer menu contains exactly 36 bindings. Normal, visual, and
 motion states use `SPC m`; insert and Emacs states use `M-SPC m`. In the table,
 replace the displayed `SPC m` prefix with `M-SPC m` in those latter two states.
 The `c`, `e`, `g`, `h`, and `r` prefixes are respectively described by
@@ -189,9 +196,12 @@ which-key as `compile/reload`, `evaluate`, `goto`, `help`, and `repl`.
 
 | Key | Command | Action |
 | --- | --- | --- |
-| `SPC m '` | `fumos-connect-or-switch` | Connect or switch to the game REPL |
+| `SPC m '` | `fumos-connect-or-switch` | Start if needed, connect, and display the game REPL |
 | `SPC m ;` | `fumos-attach` | Explicitly select and attach an instance |
 | `SPC m m` | `fumos-macroexpand` | Expand the form at point |
+| `SPC m R` | `fumos-reload-game-preserve` | Kristal `Ctrl+R`: quick reload preserving temporary state |
+| `SPC m S` | `fumos-reload-game-save` | Kristal `Ctrl+Shift+R`: reload from the latest save |
+| `SPC m 0` | `fumos-reload-game-from-start` | Kristal `Ctrl+Alt+R`: reload from the beginning |
 | `SPC m c c` | `fumos-reload-current-file` | Reload the current saved file |
 | `SPC m c m` | `fumos-reload-module` | Reload a named Fennel module |
 | `SPC m c f` | `fumos-compile-defun` | Compile the current top-level form |
@@ -223,7 +233,7 @@ which-key as `compile/reload`, `evaluate`, `goto`, `help`, and `repl`.
 | `SPC m r L` | `fumos-reload-game-save` | Reload from the latest save |
 | `SPC m r 0` | `fumos-reload-game-from-start` | Reload from the beginning |
 
-These 33 bindings are installed only in `fumos-mode` source buffers. Ordinary
+These 36 bindings are installed only in `fumos-mode` source buffers. Ordinary
 Fennel projects retain their existing localleader bindings. The one additional
 REPL-context binding, `SPC m r i` (or `M-SPC m r i`), is installed only in
 FUMOS's own `fumos-repl-mode-map`; an ordinary `fennel-proto-repl-mode` buffer
@@ -233,9 +243,17 @@ retains the exact binding it had before FUMOS loaded.
 
 | State source | Wire mode | Command | Doom key |
 | --- | --- | --- | --- |
-| Preserve temporary state | `temp` | `fumos-reload-game-preserve` | `SPC m r R` |
-| Latest save | `save` | `fumos-reload-game-save` | `SPC m r L` |
-| Beginning | `none` | `fumos-reload-game-from-start` | `SPC m r 0` |
+| Preserve temporary state | `temp` | `fumos-reload-game-preserve` | `SPC m R` (also `SPC m r R`) |
+| Latest save | `save` | `fumos-reload-game-save` | `SPC m S` (also `SPC m r L`) |
+| Beginning | `none` | `fumos-reload-game-from-start` | `SPC m 0` (also `SPC m r 0`) |
+
+These editor commands always request FUMOS's in-process
+`Kristal.quickReload` modes. They exactly match Kristal's native `Ctrl+R`,
+`Ctrl+Shift+R`, and `Ctrl+Alt+R` behavior only when the mod has
+`hardReset=false`. With `hardReset=true`, Kristal's native `Ctrl+R` path calls
+`love.event.quit("restart")` to restart the whole LÖVE/Kristal engine; the
+editor bindings do not emulate that hard restart and continue to request the
+corresponding same-process quick reload.
 
 Each command asks FUMOS to schedule a Kristal reload, watches for a replacement
 descriptor belonging to the same PID, and attaches to the new REPL session.
@@ -293,21 +311,23 @@ repository's editor test suites.
 
 ## Validation
 
-Run the five validation entry points from `.emacs/` or this repository's root:
+Run the five validation suites from `.emacs/` or this repository's root:
 
 ```sh
 make test
 make test-upstream
 make test-doom
 make test-installer
+make test-launcher
 make testall
 ```
 
 `make test` is the vanilla Emacs suite, `make test-upstream` verifies the
 vendored upstream snapshot, `make test-doom` uses the real isolated Doom PTY
-profile, and `make test-installer` exercises the pinned installer. `make
-testall` runs all four. Test counts are intentionally not frozen; read the
-current ERT counts from the output and require `0 unexpected`.
+profile, `make test-installer` exercises the pinned installer, and `make
+test-launcher` checks the Kristal launcher contract. `make testall` runs all
+five suites. Test counts are intentionally not frozen; read the current ERT
+counts from the output and require `0 unexpected`.
 
 For the legacy LuaLS configuration, this remains a useful workspace check:
 

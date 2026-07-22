@@ -2091,59 +2091,28 @@ Otherwise PATH is an untrusted wire path."
 
 (cl-defstruct fumos-game-reload-operation
   connection generation transport-generation mode pid root start-identity
-  token-digest deadline)
+  token-digest deadline candidate)
+
+(defun fumos-eval--set-game-reload-operation-candidate (operation connection)
+  "Set OPERATION's provisional CONNECTION."
+  (setf (fumos-game-reload-operation-candidate operation) connection))
 
 (defun fumos-eval--linux-stat-start-ticks (contents)
   "Return Linux proc stat start ticks parsed from CONTENTS, or nil."
-  (let ((text (string-trim-right contents "[\r\n]+")))
-    ;; The greedy comm capture ends at the final `) STATE ' delimiter, so a
-    ;; process name containing spaces or right parentheses remains harmless.
-    (when (string-match
-           "\\`[0-9]+ (.*) [[:alpha:]] \\(.*\\)\\'" text)
-      (let* ((fields (split-string (match-string 1 text) "[[:space:]]+" t))
-             (start (nth 18 fields)))
-        (when (and start (string-match-p "\\`[0-9]+\\'" start))
-          (string-to-number start))))))
+  (fumos-repl--linux-stat-start-ticks contents))
 
 (defun fumos-eval--linux-process-start-identity (pid)
   "Return PID's stable Linux kernel start identity, or nil."
-  (when (and (eq system-type 'gnu/linux) (integerp pid) (> pid 0))
-    (condition-case nil
-        (with-temp-buffer
-          (set-buffer-multibyte nil)
-          (insert-file-contents-literally (format "/proc/%d/stat" pid))
-          (when-let* ((ticks
-                       (fumos-eval--linux-stat-start-ticks (buffer-string))))
-            (list 'linux-start-ticks ticks)))
-      (error nil))))
+  (fumos-repl--linux-process-start-identity pid))
 
 (defun fumos-eval--process-start-identity (pid)
   "Return PID's normalized current-user process start identity, or nil."
-  (condition-case nil
-      (let* ((attributes (process-attributes pid))
-             (euid (and attributes (alist-get 'euid attributes)))
-             (start (and attributes (alist-get 'start attributes)))
-             (comm (and attributes (alist-get 'comm attributes))))
-        (when (and (integerp euid) (= euid (user-uid)) start)
-          (or (and (stringp comm)
-                   (fumos-eval--linux-process-start-identity pid))
-              (list 'process-attributes-start
-                    (time-convert start 'list)))))
-    (error nil)))
+  (fumos-repl--process-start-identity pid))
 
 (defun fumos-eval--canonical-game-root (root)
   "Return ROOT as a canonical local directory, or signal `user-error'."
-  (when (or (not (stringp root))
-            (file-remote-p root)
-            (not (file-name-absolute-p root)))
-    (user-error "FUMOS game reload root is not local and absolute"))
-  (let ((canonical
-         (condition-case nil
-             (file-name-as-directory (file-truename root))
-           (error nil))))
-    (unless (and canonical (file-directory-p canonical))
-      (user-error "Cannot canonicalize FUMOS game reload root"))
-    canonical))
+  (or (fumos-repl--canonical-local-root root)
+      (user-error "Cannot canonicalize FUMOS game reload root")))
 
 (defun fumos-eval--begin-game-reload (connection mode)
   "Reserve and return one token-free game reload operation."
@@ -2167,21 +2136,33 @@ Otherwise PATH is an untrusted wire path."
             (secure-hash 'sha256 value))))
     (unless start-identity
       (user-error "FUMOS process start identity is unavailable"))
+    (fumos-repl--cancel-attach-operation
+     (fumos-connection-attach-operation connection))
+    (fumos-repl--cancel-launch-for-instance instance)
+    (fumos-repl--cancel-reconnect-for-root root)
+    (fumos-repl--cancel-game-reload-for-root root)
     (let ((generation
            (1+ (or (fumos-connection-game-reload-generation connection) 0))))
       (setf (fumos-connection-game-reload-generation connection) generation
             (fumos-connection-pending-game-reload connection) mode)
-      (make-fumos-game-reload-operation
-       :connection connection :generation generation
-       :transport-generation (fumos-connection-generation connection)
-       :mode mode :pid pid :root root :start-identity start-identity
-       :token-digest token-digest
-       :deadline (+ (float-time) fumos-game-reload-timeout)))))
+      (let ((operation
+             (make-fumos-game-reload-operation
+              :connection connection :generation generation
+              :transport-generation (fumos-connection-generation connection)
+              :mode mode :pid pid :root root :start-identity start-identity
+              :token-digest token-digest
+              :deadline (+ (float-time) fumos-game-reload-timeout))))
+        (puthash root operation fumos-repl--game-reload-operations)
+        (setf (fumos-connection-attach-operation connection) operation)
+        operation))))
 
 (defun fumos-eval--game-operation-current-p (operation)
   "Return non-nil while OPERATION still owns its connection intent."
   (let ((connection (fumos-game-reload-operation-connection operation)))
     (and (fumos-connection-p connection)
+         (eq operation
+             (gethash (fumos-game-reload-operation-root operation)
+                      fumos-repl--game-reload-operations))
          (eql (fumos-game-reload-operation-generation operation)
               (fumos-connection-game-reload-generation connection))
          (eql (fumos-game-reload-operation-transport-generation operation)
@@ -2191,7 +2172,12 @@ Otherwise PATH is an untrusted wire path."
 
 (defun fumos-eval--cancel-game-reload-operation (operation)
   "Cancel OPERATION only while it still owns its connection."
-  (when (fumos-eval--game-operation-current-p operation)
+  (when (eq operation
+            (gethash (fumos-game-reload-operation-root operation)
+                     fumos-repl--game-reload-operations))
+    (remhash (fumos-game-reload-operation-root operation)
+             fumos-repl--game-reload-operations)
+    (fumos-repl--release-attach-operation-candidate operation)
     (fumos-repl--cancel-game-reload-timer
      (fumos-game-reload-operation-connection operation))
     t))
@@ -2215,47 +2201,66 @@ Otherwise PATH is an untrusted wire path."
 
 (defun fumos-eval--poll-game-reload (operation)
   "Poll once for OPERATION's same-process replacement descriptor."
-  (when (fumos-eval--game-operation-current-p operation)
+  (if (not (fumos-eval--game-operation-current-p operation))
+      (fumos-eval--cancel-game-reload-operation operation)
     (condition-case nil
         (let* ((pid (fumos-game-reload-operation-pid operation))
                (root (fumos-game-reload-operation-root operation))
-               (before (fumos-eval--process-start-identity pid))
-               match)
-          (when (and before
-                     (equal before
-                            (fumos-game-reload-operation-start-identity
-                             operation)))
-            (let ((candidates (fumos-discover-instances root))
-                  (after (fumos-eval--process-start-identity pid)))
-              (setq
-               match
-               (and (equal before after)
-                    (equal after
-                           (fumos-game-reload-operation-start-identity
-                            operation))
-                    (seq-find
-                     (lambda (candidate)
-                       (and
-                        (= pid (fumos-instance-pid candidate))
-                        (fumos-eval--candidate-root-matches-p candidate root)
-                        (fumos-eval--candidate-token-changed-p
-                         candidate operation)))
-                     candidates)))))
+               (status (fumos-repl--attach-candidate-status operation))
+               (candidate
+                (fumos-repl--attach-operation-candidate operation))
+               (expected
+                (fumos-game-reload-operation-start-identity operation))
+               (before (fumos-eval--process-start-identity pid)))
+          (when (eq status 'failed)
+            (fumos-repl--release-attach-operation-candidate operation)
+            (setq status nil))
           (cond
-           (match
+           ((not (equal before expected))
             (when (fumos-eval--cancel-game-reload-operation operation)
-              (condition-case nil
-                  (fumos-repl-connect-instance match)
-                ((error quit)
-                 (message "FUMOS game reload reconnect failed")))))
+              (fumos-repl--close-provisional-connection
+               candidate "FUMOS game reload process identity changed")
+              (message "FUMOS game reload process changed for PID %d" pid)))
+           ((eq status 'ready)
+            (fumos-eval--cancel-game-reload-operation operation))
            ((>= (float-time)
                 (fumos-game-reload-operation-deadline operation))
-            (when (fumos-eval--cancel-game-reload-operation operation)
-              (message "FUMOS game reload timed out waiting for PID %d"
-                       pid)))))
+            (let ((candidate
+                   (fumos-repl--attach-operation-candidate operation)))
+              (when (fumos-eval--cancel-game-reload-operation operation)
+                (fumos-repl--close-provisional-connection
+                 candidate "FUMOS game reload reconnect timed out")
+                (message "FUMOS game reload timed out waiting for PID %d"
+                         pid))))
+           ((eq status 'pending) nil)
+           (t
+            (let* ((candidates (fumos-discover-instances root))
+                   (after (fumos-eval--process-start-identity pid))
+                   (identity-current (equal after expected))
+                   (match
+                    (and
+                     identity-current
+                     (seq-find
+                      (lambda (candidate)
+                        (and
+                         (= pid (fumos-instance-pid candidate))
+                         (fumos-eval--candidate-root-matches-p candidate root)
+                         (fumos-eval--candidate-token-changed-p
+                          candidate operation)))
+                      candidates))))
+              (cond
+               ((not identity-current)
+                (fumos-eval--cancel-game-reload-operation operation))
+               (match
+                (condition-case nil
+                    (let ((replacement
+                           (fumos-repl-connect-instance match operation)))
+                      (fumos-repl--set-attach-operation-candidate
+                       operation replacement))
+                  ((error quit) nil))))))))
       ((error quit)
-       (when (fumos-eval--cancel-game-reload-operation operation)
-         (message "FUMOS game reload polling failed"))))))
+       ;; Keep the operation retryable until its fixed deadline.
+       nil))))
 
 (defun fumos-eval--await-game-reload (connection operation)
   "Install OPERATION's token-free replacement polling timer."

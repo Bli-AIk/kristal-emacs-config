@@ -97,10 +97,13 @@ LuaLS 根据源码和 EmmyLua 注解进行类型推导。
 ```sh
 sh .emacs/run-kristal-terminal.sh
 sh .emacs/run-kristal-terminal.sh --hold
+sh .emacs/run-kristal-terminal.sh --foreground
 ```
 
 从 kitty 或 xterm 启动时，脚本会打开独立终端；在 GUI 或非终端环境中，它会在
-当前进程运行 LÖVE，使 Emacs 可以显示输出。
+当前进程运行 LÖVE，使 Emacs 可以显示输出。`--hold` 会在 LÖVE 退出后保留已打开的
+终端。`--foreground` 始终绕过终端探测，并用 LÖVE 替换启动器进程，供 Emacs 等
+进程管理方使用；`--hold` 与 `--foreground` 不能同时使用。
 
 游戏内 FUMOS 服务只在 `Mod.info.dev == true` 时自动可用。它在 `127.0.0.1`
 上绑定随机端口，不是远程 REPL。在 Linux 上，实例描述文件位于非空的
@@ -120,14 +123,16 @@ Fennel REPL：
 - `M-x fumos-connect` 使用当前项目的唯一实例；需要时会要求选择。
 - `M-x fumos-attach` 是显式选择实例的操作。
 - `M-x fumos-connect-or-switch` 在需要时连接，否则显示已附着的游戏 REPL；该
-  REPL 可以处于 ready 或 busy 状态。
+  REPL 可以处于 ready 或 busy 状态。在 Doom 中，如果项目没有正在运行的实例，
+  `SPC m '` 还会按需启动 Kristal，然后在同一次操作中完成连接并显示 REPL；启动后
+  无需再次按键。
 - `M-x fumos-reconnect` 只重新连接先前附着的 PID。要选择另一个进程，应使用
   `fumos-attach`。
 
 典型 Doom 会话如下：
 
 ```text
-M-x fumos-connect
+SPC m '
 SPC m e e
 SPC m c c
 SPC m r i
@@ -162,16 +167,19 @@ session 并丢失 REPL locals，但游戏状态和已经提交的 live definitio
 
 ### Doom localleader 键位
 
-源码 buffer 菜单精确包含 33 个键位。normal、visual、motion state 使用
+源码 buffer 菜单精确包含 36 个键位。normal、visual、motion state 使用
 `SPC m`；insert 和 emacs state 使用 `M-SPC m`。在后两种 state 中，应把下表显示的
 `SPC m` 前缀替换为 `M-SPC m`。which-key 分别把 `c`、`e`、`g`、`h`、`r`
 前缀显示为 `compile/reload`、`evaluate`、`goto`、`help` 和 `repl`。
 
 | 键位 | 命令 | 操作 |
 | --- | --- | --- |
-| `SPC m '` | `fumos-connect-or-switch` | 连接或切换到游戏 REPL |
+| `SPC m '` | `fumos-connect-or-switch` | 按需启动、连接并显示游戏 REPL |
 | `SPC m ;` | `fumos-attach` | 显式选择并附着实例 |
 | `SPC m m` | `fumos-macroexpand` | 展开 point 处的 form |
+| `SPC m R` | `fumos-reload-game-preserve` | Kristal `Ctrl+R`：保留临时状态并快速重载 |
+| `SPC m S` | `fumos-reload-game-save` | Kristal `Ctrl+Shift+R`：从最近存档重载 |
+| `SPC m 0` | `fumos-reload-game-from-start` | Kristal `Ctrl+Alt+R`：从头开始重载 |
 | `SPC m c c` | `fumos-reload-current-file` | 重载已保存的当前文件 |
 | `SPC m c m` | `fumos-reload-module` | 重载指定名称的 Fennel module |
 | `SPC m c f` | `fumos-compile-defun` | 编译当前顶层 form |
@@ -203,7 +211,7 @@ session 并丢失 REPL locals，但游戏状态和已经提交的 live definitio
 | `SPC m r L` | `fumos-reload-game-save` | 从最近存档重载 |
 | `SPC m r 0` | `fumos-reload-game-from-start` | 从游戏开头重载 |
 
-这 33 个键位只安装到 `fumos-mode` 源码 buffer。普通 Fennel 项目保留原有
+这 36 个键位只安装到 `fumos-mode` 源码 buffer。普通 Fennel 项目保留原有
 localleader。额外的 REPL context 键位 `SPC m r i`（或 `M-SPC m r i`）只安装到
 FUMOS 自有的 `fumos-repl-mode-map`；普通 `fennel-proto-repl-mode` buffer 会保留
 FUMOS 加载前同键的精确 binding identity。
@@ -212,9 +220,15 @@ FUMOS 加载前同键的精确 binding identity。
 
 | 状态来源 | Wire mode | 命令 | Doom 键位 |
 | --- | --- | --- | --- |
-| 保留临时状态 | `temp` | `fumos-reload-game-preserve` | `SPC m r R` |
-| 最近存档 | `save` | `fumos-reload-game-save` | `SPC m r L` |
-| 从头开始 | `none` | `fumos-reload-game-from-start` | `SPC m r 0` |
+| 保留临时状态 | `temp` | `fumos-reload-game-preserve` | `SPC m R`（另有 `SPC m r R`） |
+| 最近存档 | `save` | `fumos-reload-game-save` | `SPC m S`（另有 `SPC m r L`） |
+| 从头开始 | `none` | `fumos-reload-game-from-start` | `SPC m 0`（另有 `SPC m r 0`） |
+
+这些编辑器命令始终通过 FUMOS 请求同一进程内的 `Kristal.quickReload` 模式。只有
+Mod 设置 `hardReset=false` 时，它们才与 Kristal 原生 `Ctrl+R`、
+`Ctrl+Shift+R` 和 `Ctrl+Alt+R` 的行为完全一致。设置 `hardReset=true` 时，游戏内
+原生 `Ctrl+R` 路径会调用 `love.event.quit("restart")`，重启整个 LÖVE/Kristal
+引擎；编辑器键位不会模拟这种硬重启，仍会请求对应的同进程快速重载。
 
 每个命令都会要求 FUMOS 调度 Kristal 重载，等待属于同一 PID 的 replacement
 descriptor，然后附着新的 REPL session。同步或异步错误、`C-g`/`quit` 以及其他
@@ -271,13 +285,15 @@ make test
 make test-upstream
 make test-doom
 make test-installer
+make test-launcher
 make testall
 ```
 
 `make test` 是 vanilla Emacs suite；`make test-upstream` 验证 vendored upstream
 快照；`make test-doom` 使用隔离的真实 Doom PTY profile；`make test-installer`
-测试固定版本安装器；`make testall` 运行前述四项。测试数量刻意不固定；应从当次
-输出读取实际 ERT 数量，并要求 `0 unexpected`。
+测试固定版本安装器；`make test-launcher` 检查 Kristal 启动脚本契约；`make
+testall` 运行前述五项。测试数量刻意不固定；应从当次输出读取实际 ERT 数量，并要求
+`0 unexpected`。
 
 对于旧有 LuaLS 配置，以下命令仍可用于检查工作区：
 

@@ -282,6 +282,144 @@
        (list :process network :ui-process ui-process :repl-buffer repl
              :callbacks callbacks)))))
 
+(ert-deftest fumos-failed-attach-candidates-release-resources-on-poll-or-cancel ()
+  (dolist (kind '(launch reconnect game))
+    (dolist (action '(poll cancel))
+      (let* ((fumos-repl--connections (make-hash-table :test #'equal))
+             (fumos-repl--attach-transitions (make-hash-table :test #'equal))
+             (fumos-repl--launch-operations (make-hash-table :test #'equal))
+             (fumos-repl--reconnect-operations (make-hash-table :test #'equal))
+             (fumos-repl--game-reload-operations
+              (make-hash-table :test #'equal))
+             (expected '(linux-start-ticks 100))
+             launch-process owner operation registry root snapshot)
+        (fumos-test-with-ready-connection (candidate server)
+          (setq root
+                (fumos-instance-project-root
+                 (fumos-connection-instance candidate))
+                snapshot (fumos-test-connection-snapshot candidate))
+          (unwind-protect
+              (progn
+                (pcase kind
+                  ('launch
+                   (setq launch-process
+                         (make-process
+                          :name
+                          (generate-new-buffer-name
+                           "fumos-failed-candidate-launch")
+                          :command '("sleep" "30")
+                          :connection-type 'pipe :noquery t)
+                         operation
+                         (make-fumos-launch-operation
+                          :root root :process launch-process
+                          :start-identity expected
+                          :deadline (+ (float-time) 60)
+                          :candidate candidate)
+                         registry fumos-repl--launch-operations))
+                  ('reconnect
+                   (setq owner (make-fumos-connection :state 'disconnected)
+                         operation
+                         (make-fumos-reconnect-operation
+                          :connection owner :root root :pid 4242
+                          :start-identity expected
+                          :deadline (+ (float-time) 60)
+                          :candidate candidate)
+                         registry fumos-repl--reconnect-operations))
+                  ('game
+                   (setq owner
+                         (make-fumos-connection
+                          :state 'disconnected :generation 7
+                          :game-reload-generation 3
+                          :pending-game-reload "temp")
+                         operation
+                         (make-fumos-game-reload-operation
+                          :connection owner :generation 3
+                          :transport-generation 7 :mode "temp" :pid 4242
+                          :root root :start-identity expected
+                          :deadline (+ (float-time) 60)
+                          :candidate candidate)
+                         registry fumos-repl--game-reload-operations)))
+                (puthash root operation registry)
+                (setf (fumos-connection-attach-operation candidate) operation)
+                (when owner
+                  (setf (fumos-connection-attach-operation owner) operation))
+                (should (eq candidate
+                            (gethash root fumos-repl--connections)))
+                (should (process-live-p (plist-get snapshot :process)))
+                (should (buffer-live-p (plist-get snapshot :process-buffer)))
+                (should (buffer-live-p (plist-get snapshot :repl-buffer)))
+                (if (eq action 'poll)
+                    (progn
+                      (fumos-repl--teardown-transport
+                       candidate "Transport closed")
+                      (should (fumos-connection-closing candidate))
+                      (should-not
+                       (process-live-p (plist-get snapshot :process)))
+                      (should-not
+                       (buffer-live-p (plist-get snapshot :process-buffer)))
+                      (should
+                       (buffer-live-p (plist-get snapshot :repl-buffer)))
+                      (should
+                       (eq candidate
+                           (gethash root fumos-repl--connections)))
+                      (should
+                       (eq operation
+                           (fumos-connection-attach-operation candidate))))
+                  (setf (fumos-connection-state candidate) 'disconnected))
+                (pcase action
+                  ('poll
+                   (cl-letf
+                       (((symbol-function
+                          'fumos-repl--process-start-identity)
+                         (lambda (_pid) expected))
+                        ((symbol-function
+                          'fumos-eval--process-start-identity)
+                         (lambda (_pid) expected))
+                        ((symbol-function 'fumos-discover-instances)
+                         (lambda (candidate-root)
+                           (should (equal root candidate-root))
+                           nil)))
+                     (pcase kind
+                       ('launch (fumos-repl--poll-launch operation))
+                       ('reconnect
+                        (fumos-repl--poll-unexpected-reconnect operation))
+                       ('game (fumos-eval--poll-game-reload operation)))))
+                  ('cancel
+                   (pcase kind
+                     ('launch
+                      (fumos-repl--cancel-launch-operation operation 'terminate))
+                     ('reconnect
+                      (fumos-repl--cancel-reconnect-operation operation))
+                     ('game
+                      (fumos-eval--cancel-game-reload-operation operation)))))
+                (fumos-test-assert-closed candidate snapshot)
+                (should-not (gethash root fumos-repl--connections))
+                (should-not
+                 (fumos-repl--attach-operation-candidate operation))
+                (should-not
+                 (fumos-connection-attach-operation candidate))
+                (if (eq action 'poll)
+                    (progn
+                      (should (eq operation (gethash root registry)))
+                      (when owner
+                        (should
+                         (eq operation
+                             (fumos-connection-attach-operation owner)))))
+                  (should-not (gethash root registry))
+                  (when owner
+                    (should-not
+                     (fumos-connection-attach-operation owner)))))
+            (when operation
+              (pcase kind
+                ('launch
+                 (fumos-repl--cancel-launch-operation operation 'terminate))
+                ('reconnect
+                 (fumos-repl--cancel-reconnect-operation operation))
+                ('game
+                 (fumos-eval--cancel-game-reload-operation operation))))
+            (when (process-live-p launch-process)
+              (fumos-repl--delete-process launch-process 'neutralize))))))))
+
 (ert-deftest fumos-repl-rejects-wrong-ack-without-leaking-token-or-resources ()
   (let* ((token (make-string 64 ?b))
          (messages (get-buffer-create "*Messages*"))
@@ -1309,6 +1447,8 @@
   (fumos-test-with-ready-connection (connection server)
     (let ((ui-process (fumos-connection-ui-process connection))
           (repl-buffer (fumos-connection-repl-buffer connection))
+          (original-delete-process (symbol-function 'delete-process))
+          ui-delete-observed
           failure)
       (with-current-buffer (fumos-connection-repl-buffer connection)
         (fennel-proto-repl-send-message
@@ -1316,12 +1456,23 @@
          (lambda (type message _trace)
            (setq failure (list type message)))
          #'ignore))
-      (delete-process (fumos-test-server-client server))
-      (should (fumos-test-wait-until (lambda () failure)))
+      (cl-letf (((symbol-function 'delete-process)
+                 (lambda (process)
+                   (when (eq process ui-process)
+                     (should (eq #'ignore (process-filter process)))
+                     (should (eq #'ignore (process-sentinel process)))
+                     (setq ui-delete-observed t))
+                   (funcall original-delete-process process))))
+        (delete-process (fumos-test-server-client server))
+        (should (fumos-test-wait-until (lambda () failure))))
       (should (equal '("connection-lost" "FUMOS connection closed") failure))
       ;; History remains visible, but upstream's fake comint process does not.
       (should (buffer-live-p repl-buffer))
-      (should-not (process-live-p ui-process)))))
+      (should ui-delete-observed)
+      (should-not (process-live-p ui-process))
+      (with-current-buffer repl-buffer
+        (should-not
+         (string-match-p "Process .* killed" (buffer-string)))))))
 
 (ert-deftest fumos-full-close-and-replacement-drain-dormant-disconnect-terminal ()
   (dolist (action '(close replacement))
@@ -1512,6 +1663,782 @@
                (member "FUMOS/1 CANCEL 41" lines)
                (member "FUMOS/1 DETACH" lines))))))))
 
+(ert-deftest fumos-connect-or-switch-displays-one-live-pending-or-ready-repl ()
+  (let* ((fumos-repl--connections (make-hash-table :test #'equal))
+         (fumos-repl--launch-operations (make-hash-table :test #'equal))
+         (fumos-repl--reconnect-operations (make-hash-table :test #'equal))
+         (root "/work/fumos-connect-or-switch/")
+         (repl-buffer (generate-new-buffer " *fumos-connect-or-switch*"))
+         (connection
+          (make-fumos-connection :repl-buffer repl-buffer :state 'connecting))
+         displayed
+         (connect-count 0))
+    (puthash root connection fumos-repl--connections)
+    (unwind-protect
+        (cl-letf (((symbol-function 'fumos-project-root) (lambda (&rest _) root))
+                  ((symbol-function 'fumos-repl-connect-instance)
+                   (lambda (&rest _)
+                     (cl-incf connect-count)
+                     connection))
+                  ((symbol-function 'fumos-repl--start-kristal)
+                   (lambda (&rest _)
+                     (ert-fail "existing connection launched Kristal")))
+                  ((symbol-function 'pop-to-buffer)
+                   (lambda (buffer &rest _)
+                     (should (eq repl-buffer buffer))
+                     (push buffer displayed))))
+          (dolist (state '(connecting authenticating bootstrapping ready busy))
+            (setf (fumos-connection-state connection) state)
+            (let ((before (length displayed)))
+              (fumos-connect-or-switch)
+              (should (= (1+ before) (length displayed)))
+              (should (eq repl-buffer (car displayed)))))
+          (should (= 0 connect-count))
+          (should (= 5 (length displayed))))
+      (when (buffer-live-p repl-buffer)
+        (kill-buffer repl-buffer)))))
+
+(ert-deftest fumos-connect-or-switch-connects-and-displays-one-descriptor-once ()
+  (let* ((fumos-repl--connections (make-hash-table :test #'equal))
+         (fumos-repl--launch-operations (make-hash-table :test #'equal))
+         (fumos-repl--reconnect-operations (make-hash-table :test #'equal))
+         (root "/work/fumos-existing-descriptor/")
+         (instance
+          (make-fumos-instance
+           :project-root root :mod-id "demo" :pid 4242
+           :token (make-string 64 ?a)))
+         (repl-buffer (generate-new-buffer " *fumos-provisional-repl*"))
+         (provisional
+          (make-fumos-connection
+           :instance instance :repl-buffer repl-buffer :state 'connecting))
+         displayed
+         (discover-count 0)
+         (connect-count 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'fumos-project-root) (lambda (&rest _) root))
+                  ((symbol-function 'fumos-discover-instances)
+                   (lambda (project-root)
+                     (should (equal root project-root))
+                     (cl-incf discover-count)
+                     (list instance)))
+                  ((symbol-function 'fumos-repl-connect-instance)
+                   (lambda (candidate)
+                     (should (eq instance candidate))
+                     (cl-incf connect-count)
+                     provisional))
+                  ((symbol-function 'fumos-repl--start-kristal)
+                   (lambda (&rest _)
+                     (ert-fail "descriptor path launched Kristal")))
+                  ((symbol-function 'pop-to-buffer)
+                   (lambda (buffer &rest _)
+                     (setq displayed buffer))))
+          (fumos-connect-or-switch)
+          (should (= 1 discover-count))
+          (should (= 1 connect-count))
+          (should (eq repl-buffer displayed)))
+      (when (buffer-live-p repl-buffer)
+        (kill-buffer repl-buffer)))))
+
+(ert-deftest fumos-connect-or-switch-waits-for-pending-game-reload ()
+  (let* ((fumos-repl--connections (make-hash-table :test #'equal))
+         (fumos-repl--launch-operations (make-hash-table :test #'equal))
+         (fumos-repl--reconnect-operations (make-hash-table :test #'equal))
+         (fumos-repl--game-reload-operations
+          (make-hash-table :test #'equal))
+         (root "/work/fumos-pending-game-reload/")
+         (repl-buffer (generate-new-buffer " *fumos-game-reload-history*"))
+         (history
+          (make-fumos-connection
+           :instance
+           (make-fumos-instance
+            :project-root root :mod-id "demo" :pid 4242
+            :token (make-string 64 ?a))
+           :repl-buffer repl-buffer :state 'disconnected :generation 7
+           :game-reload-generation 3 :pending-game-reload "temp"))
+         (operation
+          (make-fumos-game-reload-operation
+           :connection history :generation 3 :transport-generation 7
+           :mode "temp" :pid 4242 :root root
+           :start-identity '(linux-start-ticks 100) :deadline 60.0))
+         displayed)
+    (puthash root operation fumos-repl--game-reload-operations)
+    (setf (fumos-connection-attach-operation history) operation)
+    (unwind-protect
+        (cl-letf
+            (((symbol-function 'fumos-repl-current-connection)
+              (lambda () nil))
+             ((symbol-function 'fumos-project-root) (lambda (&rest _) root))
+             ((symbol-function 'fumos-discover-instances)
+              (lambda (&rest _)
+                (ert-fail "pending game reload rediscovered instances")))
+             ((symbol-function 'fumos-repl--start-kristal)
+              (lambda (&rest _)
+                (ert-fail "pending game reload launched another Kristal")))
+             ((symbol-function 'fumos-repl--display-connection)
+              (lambda (connection) (push connection displayed))))
+          (fumos-connect-or-switch)
+          (fumos-connect-or-switch)
+          (should (equal (list history history) displayed))
+          (should (eq operation
+                      (gethash root fumos-repl--game-reload-operations)))
+          (should (eq operation
+                      (fumos-connection-attach-operation history))))
+      (setf (fumos-connection-attach-operation history) nil)
+      (when (buffer-live-p repl-buffer)
+        (kill-buffer repl-buffer)))))
+
+(ert-deftest fumos-explicit-attach-resolves-pending-launch-by-selected-pid ()
+  (dolist (same-pid '(t nil))
+    (let* ((fumos-repl--connections (make-hash-table :test #'equal))
+           (fumos-repl--attach-transitions (make-hash-table :test #'equal))
+           (fumos-repl--launch-operations (make-hash-table :test #'equal))
+           (fumos-repl--reconnect-operations (make-hash-table :test #'equal))
+           (fumos-repl--game-reload-operations
+            (make-hash-table :test #'equal))
+           (root
+            (file-name-as-directory
+             (file-truename (make-temp-file "fumos-explicit-launch-" t))))
+           (process
+            (make-process
+             :name (generate-new-buffer-name "fumos-explicit-launch")
+             :command '("sleep" "30") :connection-type 'pipe :noquery t))
+           (owned-pid (process-id process))
+           (selected-pid (if same-pid owned-pid (+ owned-pid 1000000)))
+           (instance
+            (make-fumos-instance
+             :project-root root :mod-id "demo" :pid selected-pid
+             :token (make-string 64 ?a)))
+           (repl-buffer (generate-new-buffer " *fumos-explicit-attach*"))
+           (connection
+            (make-fumos-connection
+             :instance instance :repl-buffer repl-buffer :state 'connecting))
+           (timer (run-at-time 3600 nil #'ignore))
+           (operation
+            (make-fumos-launch-operation
+             :root root :process process :timer timer
+             :deadline (+ (float-time) 60)))
+           opened)
+      (puthash root operation fumos-repl--launch-operations)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'fumos-project-root)
+                (lambda (&rest _) root))
+               ((symbol-function 'fumos-discover-instances)
+                (lambda (candidate-root)
+                  (should (equal root candidate-root))
+                  (list instance)))
+               ((symbol-function 'fumos-select-instance)
+                (lambda (instances)
+                  (should (equal (list instance) instances))
+                  instance))
+               ((symbol-function 'fumos-repl--foreign-named-buffer)
+                (lambda (&rest _) nil))
+               ((symbol-function 'fumos-repl--new-connection)
+                (lambda (candidate)
+                  (should (eq instance candidate))
+                  connection))
+               ((symbol-function 'fumos-repl--open-instance)
+                (lambda (candidate)
+                  (should (eq connection candidate))
+                  (setq opened t)
+                  candidate)))
+            (should (eq connection (fumos-attach)))
+            (should opened)
+            (should-not (gethash root fumos-repl--launch-operations))
+            (should-not (fumos-launch-operation-timer operation))
+            (should-not (fumos-test-timer-live-p timer))
+            (should-not (fumos-connection-attach-operation connection))
+            (should (eq same-pid (and (process-live-p process) t))))
+        (remhash root fumos-repl--connections)
+        (when (process-live-p process)
+          (fumos-repl--delete-process process 'neutralize))
+        (when (timerp timer) (cancel-timer timer))
+        (when (buffer-live-p repl-buffer)
+          (with-current-buffer repl-buffer
+            (setq kill-buffer-hook nil))
+          (kill-buffer repl-buffer))
+        (delete-directory root t)))))
+
+(ert-deftest fumos-launch-deduplicates-canonical-root-and-attaches-exact-pid-once ()
+  (let* ((fumos-repl--connections (make-hash-table :test #'equal))
+         (fumos-repl--launch-operations (make-hash-table :test #'equal))
+         (fumos-repl--reconnect-operations (make-hash-table :test #'equal))
+         (root (make-temp-file "fumos-launch-root-" t))
+         (canonical (file-name-as-directory (file-truename root)))
+         (alias (concat (directory-file-name root) "-alias"))
+         (replacement-buffers
+          (list (generate-new-buffer " *fumos-launched-repl-1*")
+                (generate-new-buffer " *fumos-launched-repl-2*")))
+         (all-replacements
+          (mapcar
+           (lambda (buffer)
+             (make-fumos-connection :repl-buffer buffer :state 'connecting))
+           replacement-buffers))
+         replacement
+         (original-make-process (symbol-function 'make-process))
+         (original-run-at-time (symbol-function 'run-at-time))
+         process timer operation wrong exact discovered launch-buffer
+         (make-count 0)
+         (timer-count 0)
+         (connect-count 0)
+         (log-display-count 0)
+         (display-count 0))
+    (make-symbolic-link root alias)
+    (unwind-protect
+        (cl-letf
+            (((symbol-function 'fumos-repl--launcher-script)
+              (lambda (launch-root)
+                (should (equal canonical launch-root))
+                "/bin/true"))
+             ((symbol-function 'fumos-project-root)
+              (lambda (&rest _) canonical))
+             ((symbol-function 'make-process)
+              (lambda (&rest arguments)
+                (cl-incf make-count)
+                (setq process
+                      (funcall
+                       original-make-process
+                       :name (generate-new-buffer-name "fumos-launch-test")
+                       :buffer (plist-get arguments :buffer)
+                       :command '("sleep" "30")
+                       :connection-type 'pipe :noquery t
+                       :sentinel (plist-get arguments :sentinel)))
+                process))
+             ((symbol-function 'run-at-time)
+              (lambda (delay repeat function &rest arguments)
+                (if (and (equal delay 0.1) (equal repeat 0.1))
+                    (progn
+                      (cl-incf timer-count)
+                      (setq timer
+                            (funcall original-run-at-time 3600 nil #'ignore)))
+                  (apply original-run-at-time
+                         delay repeat function arguments))))
+             ((symbol-function 'fumos-discover-instances)
+              (lambda (launch-root)
+                (should (equal canonical launch-root))
+                discovered))
+             ((symbol-function 'fumos-repl-connect-instance)
+              (lambda (instance candidate-operation)
+                (should (eq exact instance))
+                (should (eq operation candidate-operation))
+                (cl-incf connect-count)
+                (setq replacement
+                      (nth (1- connect-count) all-replacements))))
+             ((symbol-function 'pop-to-buffer)
+              (lambda (buffer &rest _)
+                (if (memq buffer replacement-buffers)
+                    (cl-incf display-count)
+                  (setq launch-buffer buffer)
+                  (cl-incf log-display-count)))))
+          ;; The user command owns the no-descriptor launch path and exposes
+          ;; progress immediately, before a game descriptor exists.
+          (fumos-connect-or-switch)
+          (setq operation
+                (gethash canonical fumos-repl--launch-operations))
+          (should (fumos-launch-operation-p operation))
+          (should (eq launch-buffer
+                      (fumos-launch-operation-buffer operation)))
+          (should (= 1 log-display-count))
+          ;; A path alias resolves to the same pending launch operation.
+          (should (eq operation (fumos-repl--start-kristal alias)))
+          (should (= 1 make-count))
+          (should (= 1 timer-count))
+          (should (eq operation (gethash canonical fumos-repl--launch-operations)))
+          (should (fumos-test-timer-live-p timer))
+          (setq wrong
+                (make-fumos-instance
+                 :project-root canonical :mod-id "demo"
+                 :pid (1+ (process-id process)) :token (make-string 64 ?b))
+                exact
+                (make-fumos-instance
+                 :project-root canonical :mod-id "demo"
+                 :pid (process-id process) :token (make-string 64 ?c))
+                discovered (list wrong))
+          (fumos-repl--poll-launch operation)
+          (should (= 0 connect-count))
+          (should (= 0 display-count))
+          (should (eq operation (gethash canonical fumos-repl--launch-operations)))
+          (setq discovered (list wrong exact))
+          (fumos-repl--poll-launch operation)
+          (should (= 1 connect-count))
+          (should (= 1 display-count))
+          (should (eq operation
+                      (gethash canonical fumos-repl--launch-operations)))
+          (should (eq replacement
+                      (fumos-launch-operation-candidate operation)))
+          (should (eq operation
+                      (fumos-connection-attach-operation replacement)))
+          (should (fumos-test-timer-live-p timer))
+          ;; A failed provisional attach is retried within the same deadline.
+          (let ((failed replacement)
+                (failed-buffer (fumos-connection-repl-buffer replacement)))
+            (setf (fumos-connection-state failed) 'disconnected)
+            (fumos-repl--poll-launch operation)
+            (should (fumos-connection-closing failed))
+            (should-not (buffer-live-p failed-buffer))
+            (should-not (fumos-connection-attach-operation failed)))
+          (should (= 2 connect-count))
+          (should (= 2 display-count))
+          (should (eq operation
+                      (fumos-connection-attach-operation replacement)))
+          ;; A connecting candidate owns the operation without rediscovery.
+          (fumos-repl--poll-launch operation)
+          (should (= 2 connect-count))
+          (should (= 2 display-count))
+          (should (eq operation
+                      (gethash canonical fumos-repl--launch-operations)))
+          ;; Only a usable REPL completes the one-key launch intent.
+          (setf (fumos-connection-state replacement) 'ready)
+          (fumos-repl--poll-launch operation)
+          (should-not (gethash canonical fumos-repl--launch-operations))
+          (should-not (fumos-test-timer-live-p timer))
+          (should-not (fumos-connection-attach-operation replacement))
+          ;; A queued timer callback cannot repeat the completed attach.
+          (fumos-repl--poll-launch operation)
+          (should (= 2 connect-count))
+          (should (= 2 display-count)))
+      (when (timerp timer) (cancel-timer timer))
+      (when (process-live-p process)
+        (set-process-sentinel process #'ignore)
+        (delete-process process))
+      (dolist (buffer replacement-buffers)
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer)))
+      (when-let* ((buffer (get-buffer
+                           (format "*FUMOS Kristal: %s*"
+                                   (file-name-nondirectory
+                                    (directory-file-name canonical))))))
+        (kill-buffer buffer))
+      (when (file-symlink-p alias) (delete-file alias))
+      (delete-directory root t))))
+
+(ert-deftest fumos-launch-rejects-pid-reuse-before-or-during-discovery ()
+  (dolist (phase '(before-discovery during-discovery))
+    (let* ((fumos-repl--launch-operations (make-hash-table :test #'equal))
+           (root (file-name-as-directory
+                  (file-truename (make-temp-file "fumos-launch-identity-" t))))
+           (process
+            (make-process
+             :name (generate-new-buffer-name "fumos-launch-identity-test")
+             :command '("sleep" "30") :connection-type 'pipe :noquery t))
+           (timer (run-at-time 3600 nil #'ignore))
+           (expected '(linux-start-ticks 100))
+           (operation
+            (make-fumos-launch-operation
+             :root root :process process :start-identity expected
+             :timer timer :deadline (+ (float-time) 60)))
+           (instance
+            (make-fumos-instance
+             :project-root root :mod-id "demo" :pid (process-id process)
+             :token (make-string 64 ?a)))
+           (identity-reads 0)
+           discovered attached)
+      (puthash root operation fumos-repl--launch-operations)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'fumos-repl--process-start-identity)
+                (lambda (_pid)
+                  (cl-incf identity-reads)
+                  (if (and (eq phase 'during-discovery)
+                           (= identity-reads 1))
+                      expected
+                    '(linux-start-ticks 200))))
+               ((symbol-function 'fumos-discover-instances)
+                (lambda (candidate-root)
+                  (should (equal root candidate-root))
+                  (setq discovered t)
+                  (list instance)))
+               ((symbol-function 'fumos-repl-connect-instance)
+                (lambda (&rest _)
+                  (setq attached t))))
+            (fumos-repl--poll-launch operation)
+            (should (eq discovered (eq phase 'during-discovery)))
+            (should-not attached)
+            (should-not (gethash root fumos-repl--launch-operations))
+            (should-not (fumos-test-timer-live-p timer)))
+        (fumos-repl--delete-process process 'neutralize)
+        (when (timerp timer) (cancel-timer timer))
+        (delete-directory root t)))))
+
+(ert-deftest fumos-unexpected-reconnect-requires-root-pid-start-and-new-token ()
+  (let* ((fumos-repl--connections (make-hash-table :test #'equal))
+         (fumos-repl--reconnect-operations (make-hash-table :test #'equal))
+         (root (file-name-as-directory
+                (file-truename (make-temp-file "fumos-reconnect-root-" t))))
+         (other-root (file-name-as-directory
+                      (file-truename
+                       (make-temp-file "fumos-reconnect-other-" t))))
+         (pid 4242)
+         (old-token (make-string 64 ?a))
+         (new-token (make-string 64 ?b))
+         (identity '(linux-start-ticks 123456))
+         (old-instance
+          (make-fumos-instance
+           :project-root root :mod-id "demo" :pid pid :token old-token))
+         (old-buffer (generate-new-buffer " *fumos-reconnect-old*"))
+         (old
+          (make-fumos-connection
+           :instance old-instance :repl-buffer old-buffer :state 'ready))
+         (replacement-buffers
+          (list
+           (generate-new-buffer " *fumos-reconnect-replacement-1*")
+           (generate-new-buffer " *fumos-reconnect-replacement-2*")))
+         (all-replacements
+          (mapcar
+           (lambda (buffer)
+             (make-fumos-connection :repl-buffer buffer :state 'connecting))
+           replacement-buffers))
+         replacement
+         (same-token
+          (make-fumos-instance
+           :project-root root :mod-id "demo" :pid pid :token old-token))
+         (wrong-root
+          (make-fumos-instance
+           :project-root other-root :mod-id "demo" :pid pid :token new-token))
+         (wrong-pid
+          (make-fumos-instance
+           :project-root root :mod-id "demo" :pid (1+ pid) :token new-token))
+         (exact
+          (make-fumos-instance
+           :project-root root :mod-id "demo" :pid pid :token new-token))
+         (original-run-at-time (symbol-function 'run-at-time))
+         timer operation discovered rejected attached displayed
+         (connect-count 0))
+    (puthash root old fumos-repl--connections)
+    (unwind-protect
+        (cl-letf
+            (((symbol-function 'fumos-repl--process-start-identity)
+              (lambda (candidate-pid)
+                (should (= pid candidate-pid))
+                identity))
+             ((symbol-function 'fumos-repl--reject)
+              (lambda (connection message)
+                (should (eq old connection))
+                (setq rejected message)
+                (setf (fumos-connection-state connection) 'disconnected)))
+             ((symbol-function 'run-at-time)
+              (lambda (delay repeat function &rest arguments)
+                (if (and (equal delay 0.1) (equal repeat 0.1))
+                    (setq timer
+                          (funcall original-run-at-time 3600 nil #'ignore))
+                  (apply original-run-at-time
+                         delay repeat function arguments))))
+             ((symbol-function 'fumos-discover-instances)
+              (lambda (project-root)
+                (should (equal root project-root))
+                discovered))
+             ((symbol-function 'fumos-repl-connect-instance)
+              (lambda (instance candidate-operation)
+                (should (eq operation candidate-operation))
+                (cl-incf connect-count)
+                (setq attached instance)
+                (setq replacement
+                      (nth (1- connect-count) all-replacements))))
+             ((symbol-function 'fumos-repl--display-connection)
+              (lambda (connection)
+                (setq displayed connection))))
+          (fumos-repl--transport-closed old)
+          (setq operation (gethash root fumos-repl--reconnect-operations))
+          (should (fumos-reconnect-operation-p operation))
+          (should (equal "Transport closed" rejected))
+          (should (equal identity
+                         (fumos-reconnect-operation-start-identity operation)))
+          (should (fumos-test-timer-live-p timer))
+          (setf (fumos-reconnect-operation-show operation) t)
+          (setq discovered (list same-token wrong-root wrong-pid))
+          (fumos-repl--poll-unexpected-reconnect operation)
+          (should (= 0 connect-count))
+          (should (eq operation
+                      (gethash root fumos-repl--reconnect-operations)))
+          (setq discovered (list same-token wrong-root wrong-pid exact))
+          (fumos-repl--poll-unexpected-reconnect operation)
+          (should (= 1 connect-count))
+          (should (eq exact attached))
+          (should (eq replacement displayed))
+          (should (eq operation
+                      (gethash root fumos-repl--reconnect-operations)))
+          (should (eq replacement
+                      (fumos-reconnect-operation-candidate operation)))
+          (should (eq operation
+                      (fumos-connection-attach-operation replacement)))
+          (should (fumos-test-timer-live-p timer))
+          (let ((failed replacement)
+                (failed-buffer (fumos-connection-repl-buffer replacement)))
+            (setf (fumos-connection-state failed) 'disconnected)
+            (fumos-repl--poll-unexpected-reconnect operation)
+            (should (fumos-connection-closing failed))
+            (should-not (buffer-live-p failed-buffer))
+            (should-not (fumos-connection-attach-operation failed)))
+          (should (= 2 connect-count))
+          (should (eq operation
+                      (fumos-connection-attach-operation replacement)))
+          (fumos-repl--poll-unexpected-reconnect operation)
+          (should (= 2 connect-count))
+          (setf (fumos-connection-state replacement) 'ready)
+          (fumos-repl--poll-unexpected-reconnect operation)
+          (should-not (gethash root fumos-repl--reconnect-operations))
+          (should-not (fumos-test-timer-live-p timer))
+          (should-not (fumos-connection-attach-operation replacement))
+          (fumos-repl--poll-unexpected-reconnect operation)
+          (should (= 2 connect-count)))
+      (when (timerp timer) (cancel-timer timer))
+      (dolist (buffer (cons old-buffer replacement-buffers))
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer (setq kill-buffer-hook nil))
+          (kill-buffer buffer)))
+      (delete-directory other-root t)
+      (delete-directory root t))))
+
+(ert-deftest fumos-unexpected-reconnect-rejects-pid-reuse ()
+  (let* ((fumos-repl--connections (make-hash-table :test #'equal))
+         (fumos-repl--reconnect-operations (make-hash-table :test #'equal))
+         (root (file-name-as-directory
+                (file-truename (make-temp-file "fumos-pid-reuse-root-" t))))
+         (pid 4242)
+         (instance
+          (make-fumos-instance
+           :project-root root :mod-id "demo" :pid pid
+           :token (make-string 64 ?a)))
+         (connection
+          (make-fumos-connection :instance instance :state 'disconnected))
+         (operation
+          (make-fumos-reconnect-operation
+           :connection connection :root root :pid pid
+           :start-identity '(linux-start-ticks 100)
+           :token-digest (fumos-repl--token-digest instance)
+           :deadline (+ (float-time) 60)))
+         discovered attached)
+    (puthash root connection fumos-repl--connections)
+    (puthash root operation fumos-repl--reconnect-operations)
+    (unwind-protect
+        (cl-letf (((symbol-function 'fumos-repl--process-start-identity)
+                   (lambda (_pid) '(linux-start-ticks 200)))
+                  ((symbol-function 'fumos-discover-instances)
+                   (lambda (&rest _)
+                     (setq discovered t)
+                     nil))
+                  ((symbol-function 'fumos-repl-connect-instance)
+                   (lambda (&rest _)
+                     (setq attached t))))
+          (fumos-repl--poll-unexpected-reconnect operation)
+          (should-not discovered)
+          (should-not attached)
+          (should-not (gethash root fumos-repl--reconnect-operations)))
+      (fumos-repl--cancel-reconnect-operation operation)
+      (delete-directory root t))))
+
+(ert-deftest fumos-unexpected-reconnect-revalidates-pid-with-candidate ()
+  (dolist (state '(connecting ready))
+    (let* ((fumos-repl--reconnect-operations
+            (make-hash-table :test #'equal))
+           (root (file-name-as-directory
+                  (file-truename
+                   (make-temp-file "fumos-reconnect-candidate-pid-" t))))
+           (pid 4242)
+           (history (make-fumos-connection :state 'disconnected))
+           (candidate (make-fumos-connection :state state))
+           (operation
+            (make-fumos-reconnect-operation
+             :connection history :root root :pid pid
+             :start-identity '(linux-start-ticks 100)
+             :deadline (+ (float-time) 60) :timer 'candidate-timer
+             :candidate candidate))
+           closed canceled discovered)
+      (puthash root operation fumos-repl--reconnect-operations)
+      (setf (fumos-connection-attach-operation history) operation
+            (fumos-connection-attach-operation candidate) operation)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'fumos-repl--process-start-identity)
+                (lambda (candidate-pid)
+                  (should (= pid candidate-pid))
+                  '(linux-start-ticks 200)))
+               ((symbol-function 'fumos-discover-instances)
+                (lambda (&rest _)
+                  (setq discovered t)
+                  nil))
+               ((symbol-function 'cancel-timer)
+                (lambda (timer) (setq canceled timer)))
+               ((symbol-function 'fumos-repl-close)
+                (lambda (connection &optional message)
+                  (setq closed (list connection message)))))
+            (fumos-repl--poll-unexpected-reconnect operation)
+            (should-not discovered)
+            (should-not (gethash root fumos-repl--reconnect-operations))
+            (should-not (fumos-reconnect-operation-candidate operation))
+            (should-not (fumos-connection-attach-operation history))
+            (should-not (fumos-connection-attach-operation candidate))
+            (should (eq 'candidate-timer canceled))
+            (should (eq candidate (car closed)))
+            (should (string-match-p "identity changed" (cadr closed))))
+        (delete-directory root t)))))
+
+(ert-deftest fumos-unexpected-reconnect-terminal-watch-clears-all-owners ()
+  (dolist (cause '(timeout pid-change))
+    (let* ((fumos-repl--reconnect-operations
+            (make-hash-table :test #'equal))
+           (root (format "/work/fumos-reconnect-%s/" cause))
+           (pid 4242)
+           (expected '(linux-start-ticks 100))
+           (history (make-fumos-connection :state 'disconnected))
+           (candidate (make-fumos-connection :state 'connecting))
+           (operation
+            (make-fumos-reconnect-operation
+             :connection history :root root :pid pid
+             :start-identity expected :deadline 10.0
+             :timer 'terminal-watch-timer :candidate candidate))
+           canceled closed)
+      (puthash root operation fumos-repl--reconnect-operations)
+      (setf (fumos-connection-attach-operation history) operation
+            (fumos-connection-attach-operation candidate) operation)
+      (cl-letf
+          (((symbol-function 'float-time)
+            (lambda (&rest _) (if (eq cause 'timeout) 11.0 0.0)))
+           ((symbol-function 'fumos-repl--process-start-identity)
+            (lambda (candidate-pid)
+              (should (= pid candidate-pid))
+              (if (eq cause 'pid-change)
+                  '(linux-start-ticks 200)
+                expected)))
+           ((symbol-function 'fumos-discover-instances)
+            (lambda (&rest _)
+              (ert-fail "terminal reconnect branch performed discovery")))
+           ((symbol-function 'cancel-timer)
+            (lambda (timer) (push timer canceled)))
+           ((symbol-function 'fumos-repl-close)
+            (lambda (connection &optional message)
+              (setq closed (list connection message)))))
+        (fumos-repl--poll-unexpected-reconnect operation)
+        (should-not (gethash root fumos-repl--reconnect-operations))
+        (should-not (fumos-reconnect-operation-candidate operation))
+        (should-not (fumos-reconnect-operation-timer operation))
+        (should-not (fumos-connection-attach-operation history))
+        (should-not (fumos-connection-attach-operation candidate))
+        (should (equal '(terminal-watch-timer) canceled))
+        (should (eq candidate (car closed)))
+        (should
+         (string-match-p
+          (if (eq cause 'timeout) "timed out" "identity changed")
+          (cadr closed)))))))
+
+(ert-deftest fumos-reconnect-intent-is-canceled-by-disconnect-kill-or-replacement ()
+  (dolist (action '(disconnect missing-root kill replacement))
+    (let* ((fumos-repl--connections (make-hash-table :test #'equal))
+           (fumos-repl--attach-transitions (make-hash-table :test #'equal))
+           (fumos-repl--reconnect-operations (make-hash-table :test #'equal))
+           (root
+            (file-name-as-directory
+             (file-truename (make-temp-file "fumos-cancel-reconnect-" t))))
+           (instance
+            (make-fumos-instance
+             :project-root root :mod-id "demo" :pid 4242
+             :token (make-string 64 ?a)))
+           (old-buffer (generate-new-buffer " *fumos-cancel-reconnect-old*"))
+           (old
+            (make-fumos-connection
+             :instance instance :repl-buffer old-buffer :state 'disconnected))
+           (timer (run-at-time 3600 nil #'ignore))
+           (operation
+            (make-fumos-reconnect-operation
+             :connection old :root root :pid 4242
+             :start-identity '(linux-start-ticks 100)
+             :token-digest (fumos-repl--token-digest instance)
+             :timer timer :deadline (+ (float-time) 60)))
+           new-buffer replacement attached)
+      (puthash root old fumos-repl--connections)
+      (puthash root operation fumos-repl--reconnect-operations)
+      (unwind-protect
+          (pcase action
+            ('disconnect
+             (cl-letf (((symbol-function 'fumos-repl-current-connection)
+                        (lambda () old))
+                       ((symbol-function 'fumos-repl--cancel-game-reload-timer)
+                        #'ignore)
+                       ((symbol-function 'fumos-repl--mark-disconnected)
+                        #'ignore))
+               (fumos-disconnect)))
+            ('missing-root
+             (delete-directory root t)
+             (cl-letf (((symbol-function 'fumos-repl-current-connection)
+                        (lambda () old))
+                       ((symbol-function 'fumos-repl--cancel-game-reload-timer)
+                        #'ignore)
+                       ((symbol-function 'fumos-repl--mark-disconnected)
+                        #'ignore))
+               (fumos-disconnect)))
+            ('kill
+             (with-current-buffer old-buffer
+               (setq-local fumos-repl--connection old)
+               (cl-letf
+                   (((symbol-function 'fumos-repl--cancel-game-reload-timer)
+                     #'ignore)
+                    ((symbol-function 'fumos-repl--teardown-transport)
+                     #'ignore)
+                    ((symbol-function 'fumos-repl--unregister-if-current)
+                     #'ignore))
+                 (fumos-repl--kill-buffer-cleanup))))
+            ('replacement
+             (setq new-buffer
+                   (generate-new-buffer " *fumos-cancel-reconnect-new*")
+                   replacement
+                   (make-fumos-connection
+                    :instance instance :repl-buffer new-buffer
+                    :state 'connecting))
+             (cl-letf
+                 (((symbol-function 'fumos-repl--foreign-named-buffer)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'fumos-repl--new-connection)
+                   (lambda (_instance) replacement))
+                  ((symbol-function 'fumos-repl--open-instance)
+                   (lambda (connection) connection))
+                  ((symbol-function 'fumos-repl-close)
+                   (lambda (connection &optional _message)
+                     (fumos-repl--suppress-reconnect connection)
+                     (when (eq connection (gethash root fumos-repl--connections))
+                       (remhash root fumos-repl--connections)))))
+               (should (eq replacement
+                           (fumos-repl-connect-instance instance))))))
+          (should (fumos-connection-reconnect-suppressed old))
+          (should-not (gethash root fumos-repl--reconnect-operations))
+          (should-not (fumos-test-timer-live-p timer))
+          (cl-letf (((symbol-function 'fumos-repl-connect-instance)
+                     (lambda (&rest _) (setq attached t))))
+            (fumos-repl--poll-unexpected-reconnect operation))
+          (should-not attached)
+        (when (timerp timer) (cancel-timer timer))
+        (dolist (buffer (list old-buffer new-buffer))
+          (when (buffer-live-p buffer)
+            (with-current-buffer buffer
+              (setq fumos-repl--connection nil
+                    kill-buffer-hook nil))
+            (kill-buffer buffer)))
+        (when (file-directory-p root)
+          (delete-directory root t))))))
+
+(ert-deftest fumos-replacement-bootstrap-inserts-lexical-locals-reset-notice ()
+  (let* ((buffer (generate-new-buffer " *fumos-session-reset-notice*"))
+         (connection
+          (make-fumos-connection
+           :repl-buffer buffer :state 'bootstrapping
+           :session-reset-notice t)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'fumos-repl--bootstrap-commit-owned-p)
+                   (lambda (candidate) (eq connection candidate)))
+                  ((symbol-function 'fumos-repl--start-upstream-ui) #'ignore)
+                  ((symbol-function 'fumos-repl--link-project-buffers) #'ignore)
+                  ((symbol-function 'fumos-repl--refresh-macro-cache) #'ignore)
+                  ((symbol-function 'message) #'ignore))
+          (fumos-repl--finish-bootstrap
+           connection '(ok "0.6.4" "1.6.1" "LuaJIT 2.1"))
+          (should (eq 'ready (fumos-connection-state connection)))
+          (with-current-buffer buffer
+            (should
+             (equal
+              ";; FUMOS started a new REPL session; lexical locals were reset.\n"
+              (buffer-string)))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
 (ert-deftest fumos-reconnect-refuses-another-pid ()
   (fumos-test-with-ready-connection (connection server)
     (let ((other
@@ -1575,6 +2502,13 @@
       (should (fumos-test-wait-until
                (lambda () (eq 'ready (fumos-connection-state replacement)))))
       (with-current-buffer (fumos-connection-repl-buffer replacement)
+        (let ((history (buffer-string)))
+          (should
+           (string-prefix-p
+            ";; FUMOS started a new REPL session; lexical locals were reset.\n"
+            history))
+          (should-not (string-search ">> ;; FUMOS started" history))
+          (should (string-suffix-p fennel-proto-repl-prompt history)))
         (fennel-proto-repl-send-message :eval "new"
                                         (lambda (v) (setq new-value v))))
       ;; Saved old closures and bootstrap callback are deliberately invoked late.

@@ -15,6 +15,9 @@
           :desc "FUMOS connect/REPL" "'" #'fumos-connect-or-switch
           :desc "FUMOS attach instance" ";" #'fumos-attach
           :desc "Expand macro" "m" #'fumos-macroexpand
+          :desc "Quick reload (Ctrl+R)" "R" #'fumos-reload-game-preserve
+          :desc "Reload save (Ctrl+Shift+R)" "S" #'fumos-reload-game-save
+          :desc "Restart mod (Ctrl+Alt+R)" "0" #'fumos-reload-game-from-start
           (:prefix ("c" . "compile/reload")
            :desc "Reload current file" "c" #'fumos-reload-current-file
            :desc "Reload module" "m" #'fumos-reload-module

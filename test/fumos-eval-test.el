@@ -1461,6 +1461,69 @@
                (fumos-connection-pending-game-reload connection)))))
       (delete-directory root t))))
 
+(ert-deftest fumos-game-reload-supersedes-ready-attach-operation-ownership ()
+  (dolist (kind '(launch reconnect))
+    (let* ((fumos-repl--launch-operations (make-hash-table :test #'equal))
+           (fumos-repl--reconnect-operations (make-hash-table :test #'equal))
+           (fumos-repl--game-reload-operations
+            (make-hash-table :test #'equal))
+           (root
+            (file-name-as-directory
+             (file-truename (make-temp-file "fumos-game-owner-" t))))
+           (connection
+            (fumos-test-game-connection root (make-string 64 ?a)))
+           (history
+            (and (eq kind 'reconnect)
+                 (make-fumos-connection :state 'disconnected)))
+           (old-timer (intern (format "%s-owner-timer" kind)))
+           (old-operation
+            (if (eq kind 'launch)
+                (make-fumos-launch-operation
+                 :root root :timer old-timer :candidate connection)
+              (make-fumos-reconnect-operation
+               :connection history :root root :pid 4242
+               :start-identity '(linux-start-ticks 100)
+               :timer old-timer :deadline 60.0 :candidate connection)))
+           canceled game-operation)
+      (puthash root old-operation
+               (if (eq kind 'launch)
+                   fumos-repl--launch-operations
+                 fumos-repl--reconnect-operations))
+      (setf (fumos-connection-attach-operation connection) old-operation)
+      (when history
+        (setf (fumos-connection-attach-operation history) old-operation))
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'fumos-eval--process-start-identity)
+                (lambda (pid)
+                  (should (= 4242 pid))
+                  '(linux-start-ticks 100)))
+               ((symbol-function 'cancel-timer)
+                (lambda (timer) (push timer canceled))))
+            (setq game-operation
+                  (fumos-eval--begin-game-reload connection "temp"))
+            (should (fumos-game-reload-operation-p game-operation))
+            (should (eq game-operation
+                        (gethash root fumos-repl--game-reload-operations)))
+            (should (eq game-operation
+                        (fumos-connection-attach-operation connection)))
+            (should-not (fumos-repl--attach-operation-candidate old-operation))
+            (should-not
+             (gethash root
+                      (if (eq kind 'launch)
+                          fumos-repl--launch-operations
+                        fumos-repl--reconnect-operations)))
+            (should-not
+             (if (eq kind 'launch)
+                 (fumos-launch-operation-timer old-operation)
+               (fumos-reconnect-operation-timer old-operation)))
+            (should (equal (list old-timer) canceled))
+            (when history
+              (should-not (fumos-connection-attach-operation history))))
+        (when game-operation
+          (fumos-eval--cancel-game-reload-operation game-operation))
+        (delete-directory root t)))))
+
 (ert-deftest fumos-game-reload-rejects-pid-reuse ()
   (let* ((root (make-temp-file "fumos-game-pid-root-" t))
          (token (make-string 64 ?a))
@@ -1495,45 +1558,118 @@
           (funcall callback)
           (funcall callback)
           (should-not connected)
-          (should (equal "temp"
-                         (fumos-connection-pending-game-reload connection))))
+          (should-not (fumos-connection-pending-game-reload connection))
+          (should-not (fumos-connection-game-reload-timer connection))
+          (should-not (fumos-connection-attach-operation connection)))
       (fumos-repl--cancel-game-reload-timer connection)
       (delete-directory root t))))
 
+(ert-deftest fumos-game-reload-revalidates-pid-with-candidate ()
+  (dolist (state '(connecting ready))
+    (let* ((fumos-repl--game-reload-operations
+            (make-hash-table :test #'equal))
+           (root (file-name-as-directory
+                  (file-truename
+                   (make-temp-file "fumos-game-candidate-pid-" t))))
+           (pid 4242)
+           (owner
+            (make-fumos-connection
+             :state 'disconnected :generation 7
+             :game-reload-generation 3 :pending-game-reload "temp"
+             :game-reload-timer 'candidate-timer))
+           (candidate (make-fumos-connection :state state))
+           (operation
+            (make-fumos-game-reload-operation
+             :connection owner :generation 3 :transport-generation 7
+             :mode "temp" :pid pid :root root
+             :start-identity '(linux-start-ticks 100)
+             :deadline (+ (float-time) 60) :candidate candidate))
+           closed canceled discovered)
+      (puthash root operation fumos-repl--game-reload-operations)
+      (setf (fumos-connection-attach-operation owner) operation
+            (fumos-connection-attach-operation candidate) operation)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'fumos-eval--process-start-identity)
+                (lambda (candidate-pid)
+                  (should (= pid candidate-pid))
+                  '(linux-start-ticks 200)))
+               ((symbol-function 'fumos-discover-instances)
+                (lambda (&rest _)
+                  (setq discovered t)
+                  nil))
+               ((symbol-function 'cancel-timer)
+                (lambda (timer) (setq canceled timer)))
+               ((symbol-function 'fumos-repl-close)
+                (lambda (connection &optional message)
+                  (setq closed (list connection message)))))
+            (fumos-eval--poll-game-reload operation)
+            (should-not discovered)
+            (should-not (gethash root fumos-repl--game-reload-operations))
+            (should-not (fumos-game-reload-operation-candidate operation))
+            (should-not (fumos-connection-attach-operation owner))
+            (should-not (fumos-connection-attach-operation candidate))
+            (should-not (fumos-connection-pending-game-reload owner))
+            (should-not (fumos-connection-game-reload-timer owner))
+            (should (eq 'candidate-timer canceled))
+            (should (eq candidate (car closed)))
+            (should (string-match-p "identity changed" (cadr closed))))
+        (delete-directory root t)))))
+
 (ert-deftest fumos-game-reload-rejects-transport-generation-change ()
-  (let* ((root (make-temp-file "fumos-game-generation-root-" t))
-         (connection
-          (fumos-test-game-connection root (make-string 64 ?a)))
-         (start (current-time)) callback connected)
-    (unwind-protect
-        (cl-letf
-            (((symbol-function 'process-attributes)
-              (lambda (_pid) (fumos-test-process-attributes-at start)))
-             ((symbol-function 'run-at-time)
-              (lambda (_delay _repeat function &rest _)
-                (setq callback function)
-                'generation-timer))
-             ((symbol-function 'timerp)
-              (lambda (value) (eq value 'generation-timer)))
-             ((symbol-function 'cancel-timer) #'ignore)
-             ((symbol-function 'fumos-discover-instances)
-              (lambda (_root)
-                (list
-                 (make-fumos-instance
-                  :project-root root :mod-id "demo" :pid 4242
-                  :token (make-string 64 ?b)))))
-             ((symbol-function 'fumos-repl-connect-instance)
-              (lambda (&rest _) (setq connected t))))
-          (let ((operation
-                 (fumos-eval--begin-game-reload connection "temp")))
-            (fumos-eval--await-game-reload connection operation))
-          (cl-incf (fumos-connection-generation connection))
-          (funcall callback)
-          (should-not connected)
-          (should (equal "temp"
-                         (fumos-connection-pending-game-reload connection))))
-      (fumos-repl--cancel-game-reload-timer connection)
-      (delete-directory root t))))
+  (dolist (stale '(transport-generation game-reload-generation mode))
+    (let* ((fumos-repl--game-reload-operations
+            (make-hash-table :test #'equal))
+           (root (make-temp-file "fumos-game-generation-root-" t))
+           (connection
+            (fumos-test-game-connection root (make-string 64 ?a)))
+           (candidate (make-fumos-connection :state 'connecting))
+           (start (current-time)) callback connected canceled operation)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'process-attributes)
+                (lambda (_pid) (fumos-test-process-attributes-at start)))
+               ((symbol-function 'run-at-time)
+                (lambda (_delay _repeat function &rest _)
+                  (setq callback function)
+                  'generation-timer))
+               ((symbol-function 'timerp)
+                (lambda (value) (eq value 'generation-timer)))
+               ((symbol-function 'cancel-timer)
+                (lambda (timer) (push timer canceled)))
+               ((symbol-function 'fumos-discover-instances)
+                (lambda (_root)
+                  (list
+                   (make-fumos-instance
+                    :project-root root :mod-id "demo" :pid 4242
+                    :token (make-string 64 ?b)))))
+               ((symbol-function 'fumos-repl-connect-instance)
+                (lambda (&rest _) (setq connected t))))
+            (setq operation
+                  (fumos-eval--begin-game-reload connection "temp"))
+            (fumos-eval--await-game-reload connection operation)
+            (fumos-repl--set-attach-operation-candidate operation candidate)
+            (pcase stale
+              ('transport-generation
+               (cl-incf (fumos-connection-generation connection)))
+              ('game-reload-generation
+               (cl-incf (fumos-connection-game-reload-generation connection)))
+              ('mode
+               (setf (fumos-connection-pending-game-reload connection) "save")))
+            (funcall callback)
+            (should-not connected)
+            (should-not (gethash root fumos-repl--game-reload-operations))
+            (should-not (fumos-connection-pending-game-reload connection))
+            (should-not (fumos-connection-game-reload-timer connection))
+            (should-not (fumos-connection-attach-operation connection))
+            (should-not (fumos-game-reload-operation-candidate operation))
+            (should-not (fumos-connection-attach-operation candidate))
+            (should (equal '(generation-timer) canceled))
+            ;; A stale callback remains harmless after its operation is gone.
+            (funcall callback)
+            (should (equal '(generation-timer) canceled)))
+        (fumos-repl--cancel-game-reload-timer connection)
+        (delete-directory root t)))))
 
 (ert-deftest fumos-game-reload-timer-and-connection-print-without-token ()
   (let* ((root (make-temp-file "fumos-game-print-root-" t))
@@ -1579,17 +1715,16 @@
           (make-fumos-instance
            :project-root root :mod-id "demo" :pid 4242 :token new-token))
          (start (current-time))
-         (race nil) (attribute-read 0) (now 0.0)
-         candidates callback connected canceled)
+         (replacements
+          (list (make-fumos-connection :state 'connecting)
+                (make-fumos-connection :state 'connecting)))
+         replacement
+         (now 0.0) candidates callback operation connected canceled)
     (unwind-protect
         (cl-letf
             (((symbol-function 'process-attributes)
               (lambda (_pid)
-                (cl-incf attribute-read)
-                (fumos-test-process-attributes-at
-                 (if (and race (cl-evenp attribute-read))
-                    (time-add start (seconds-to-time 1))
-                   start))))
+                (fumos-test-process-attributes-at start)))
              ((symbol-function 'float-time) (lambda (&rest _) now))
              ((symbol-function 'run-at-time)
               (lambda (_delay _repeat function &rest _)
@@ -1602,27 +1737,46 @@
              ((symbol-function 'fumos-discover-instances)
               (lambda (_root) candidates))
              ((symbol-function 'fumos-repl-connect-instance)
-              (lambda (instance) (push instance connected) 'replacement)))
-          (let ((operation
-                 (fumos-eval--begin-game-reload connection "temp")))
-            (fumos-eval--await-game-reload connection operation))
+              (lambda (instance candidate-operation)
+                (should (eq operation candidate-operation))
+                (push instance connected)
+                (setq replacement (pop replacements)))))
+          (setq operation
+                (fumos-eval--begin-game-reload connection "temp"))
+          (fumos-eval--await-game-reload connection operation)
           (dolist (candidate (list old same-token wrong-root wrong-pid))
             (setq candidates (list candidate))
             (funcall callback)
             (should-not connected)
             (should (fumos-connection-pending-game-reload connection)))
-          (setq candidates (list match) race t attribute-read 1)
+          (setq candidates (list match) now 1.0)
           (funcall callback)
-          (should-not connected)
+          (should (equal (list match) connected))
+          (should (equal "temp"
+                         (fumos-connection-pending-game-reload connection)))
+          (should (eq replacement
+                      (fumos-game-reload-operation-candidate operation)))
+          (should (eq operation
+                      (fumos-connection-attach-operation replacement)))
+          ;; A failed candidate is retried within the original deadline.
+          (let ((failed replacement))
+            (setf (fumos-connection-state failed) 'disconnected)
+            (funcall callback)
+            (should (fumos-connection-closing failed))
+            (should-not (fumos-connection-attach-operation failed)))
+          (should (equal (list match match) connected))
+          (should (eq operation
+                      (fumos-connection-attach-operation replacement)))
+          ;; A connecting candidate is not rediscovered or counted as done.
+          (funcall callback)
+          (should (equal (list match match) connected))
           (should (fumos-connection-pending-game-reload connection))
-          ;; A valid replacement wins even when this poll is first scheduled
-          ;; at the deadline boundary.
-          (setq race nil attribute-read 0 now 31.0)
+          (setf (fumos-connection-state replacement) 'ready)
           (funcall callback)
-          (should (equal (list match) connected))
           (should-not (fumos-connection-pending-game-reload connection))
+          (should-not (fumos-connection-attach-operation replacement))
           (funcall callback)
-          (should (equal (list match) connected))
+          (should (equal (list match match) connected))
           (should (= 1 (length canceled))))
       (fumos-repl--cancel-game-reload-timer connection)
       (delete-directory other-root t)
@@ -1846,16 +2000,17 @@
       (should-not (fumos-connection-pending-game-reload connection))
       (should-not (fumos-connection-game-reload-timer connection)))))
 
-(ert-deftest fumos-game-reload-connect-exits-are-contained-and-once ()
+(ert-deftest fumos-game-reload-connect-exits-retry-until-deadline ()
   (dolist (kind '(error quit))
     (let* ((root (make-temp-file "fumos-game-connect-root-" t))
            (token (make-string 64 ?a))
            (connection (fumos-test-game-connection root token))
-           (start (current-time)) callback (calls 0) messages)
+           (start (current-time)) callback (calls 0) messages (now 0.0))
       (unwind-protect
           (cl-letf
               (((symbol-function 'process-attributes)
                 (lambda (_pid) (fumos-test-process-attributes-at start)))
+               ((symbol-function 'float-time) (lambda (&rest _) now))
                ((symbol-function 'run-at-time)
                 (lambda (_delay _repeat function &rest _)
                   (setq callback function) 'connect-timer))
@@ -1881,12 +2036,17 @@
             (should-not (condition-case nil (progn (funcall callback) nil)
                           ((error quit) t)))
             (funcall callback)
-            (should (= 1 calls))
+            (should (= 2 calls))
+            (should (fumos-connection-pending-game-reload connection))
+            (should-not messages)
+            (setq now 31.0)
+            (funcall callback)
+            (should (= 2 calls))
             (should-not (fumos-connection-pending-game-reload connection))
             (should
              (seq-some
               (lambda (value)
-                (string-match-p "FUMOS game reload reconnect failed" value))
+                (string-match-p "FUMOS game reload timed out" value))
               messages))
             (dolist (value messages)
               (should-not (string-match-p (regexp-quote token) value))))

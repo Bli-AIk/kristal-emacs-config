@@ -28,6 +28,9 @@
   '(("'" . fumos-connect-or-switch)
     (";" . fumos-attach)
     ("m" . fumos-macroexpand)
+    ("R" . fumos-reload-game-preserve)
+    ("S" . fumos-reload-game-save)
+    ("0" . fumos-reload-game-from-start)
     ("c c" . fumos-reload-current-file)
     ("c m" . fumos-reload-module)
     ("c f" . fumos-compile-defun)
@@ -312,7 +315,7 @@ When WRONG-PREFIX-P is non-nil, query the localleader for the wrong state."
 
 (ert-deftest fumos-doom-source-has-all-bindings-in-five-states ()
   (let ((suffixes (mapcar #'car fumos-test-doom-source-bindings)))
-    (should (= 33 (length suffixes)))
+    (should (= 36 (length suffixes)))
     (should (= (length suffixes)
                (length (delete-dups (copy-sequence suffixes))))))
   (with-temp-buffer

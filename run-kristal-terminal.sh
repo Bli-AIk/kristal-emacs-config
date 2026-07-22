@@ -1,16 +1,31 @@
 #!/bin/sh
 set -eu
 
+usage() {
+  echo "usage: $0 [--hold | --foreground]" >&2
+  exit 64
+}
+
 hold=0
-case "${1:-}" in
-  --hold)
-    hold=1
+foreground=0
+case $# in
+  0)
     ;;
-  "")
+  1)
+    case $1 in
+      --hold)
+        hold=1
+        ;;
+      --foreground)
+        foreground=1
+        ;;
+      *)
+        usage
+        ;;
+    esac
     ;;
   *)
-    echo "usage: $0 [--hold]" >&2
-    exit 64
+    usage
     ;;
 esac
 
@@ -74,6 +89,10 @@ run_game() {
   cd "$engine_root"
   exec love "$engine_root" --mod "$mod_id" --auto-mod-start
 }
+
+if [ "$foreground" -eq 1 ]; then
+  run_game
+fi
 
 title="Kristal - $mod_id"
 
