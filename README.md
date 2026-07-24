@@ -6,6 +6,21 @@ The repository is intended to be installed as a Git submodule at
 `<mod>/.emacs/`. It provides LuaLS configuration, Kristal API metadata paths,
 Lua inlay hints, and a script for launching the current mod through Kristal.
 
+## Branches
+
+This repository maintains three intended configuration lines:
+
+- main: the current integration line for shared Lua/Kristal support and
+  optional FUMOS tooling.
+- stable/lua: the minimal Lua-only baseline for standard Kristal templates.
+- experimental/fumos: the FUMOS FLY workflow, Fennel tooling, and live
+  in-game REPL integration.
+
+Parent mods can pin this branch explicitly:
+
+    git submodule set-branch --branch stable/lua .emacs
+    # Use experimental/fumos for a FUMOS project.
+
 ## Install as a submodule
 
 ```sh

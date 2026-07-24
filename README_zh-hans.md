@@ -5,6 +5,19 @@
 本仓库设计为以 Git 子模块放在 `<mod>/.emacs/` 中，提供 LuaLS 配置、
 Kristal API 类型信息路径、Lua 内联类型提示，以及启动当前 Mod 的脚本。
 
+## 分支
+
+本仓库维护三条有明确用途的配置线：
+
+- main：共享 Lua/Kristal 支持和可选 FUMOS 工具的当前集成线。
+- stable/lua：标准 Kristal 模板使用的最小 Lua 基线。
+- experimental/fumos：FUMOS FLY 工作流、Fennel 工具和游戏内 live REPL。
+
+父 Mod 可以显式固定该分支：
+
+    git submodule set-branch --branch stable/lua .emacs
+    # FUMOS 项目使用 experimental/fumos。
+
 ## 作为子模块安装
 
 ```sh
