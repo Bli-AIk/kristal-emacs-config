@@ -52,25 +52,26 @@ if [ -z "$mod_id" ]; then
 fi
 
 find_engine_root() {
+  # Prefer the nearest matching engine in the mod's parent tree, keeping a
+  # project-local checkout authoritative even when KRISTAL_ROOT is inherited.
+  dir=$(CDPATH='' cd "$mod_root" && pwd -P)
+  while :; do
+    if [ -f "$dir/main.lua" ] && [ -f "$dir/src/kristal.lua" ]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+    parent=$(dirname "$dir")
+    if [ "$parent" = "$dir" ]; then
+      break
+    fi
+    dir=$parent
+  done
+
+  # Fall back to an explicit engine path when the mod is outside an engine tree.
   if [ -n "${KRISTAL_ROOT:-}" ]; then
     printf '%s\n' "$KRISTAL_ROOT"
     return 0
   fi
-
-  for candidate in \
-    "$mod_root/../Kristal" \
-    "$mod_root/../kristal" \
-    "$mod_root/../../Kristal" \
-    "$mod_root/../../kristal" \
-    "$HOME/Projects/LuaProjects/Kristal" \
-    "$HOME/Projects/Kristal" \
-    "$HOME/Kristal"
-  do
-    if [ -f "$candidate/main.lua" ]; then
-      CDPATH='' cd "$candidate" && pwd -P
-      return 0
-    fi
-  done
 
   return 1
 }
