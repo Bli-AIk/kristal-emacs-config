@@ -111,9 +111,9 @@ The existing LuaLS configuration enables:
 - LuaJIT runtime semantics and the Love2D library.
 - Kristal source, generated Lua docs, and official `luadoc_meta` signatures as
   external libraries, including the generic `Class` constructor signature.
-- Library globals (`ObjectEditor`, `KristalDebugTools`, `VirtualKeyboard`):
-  the mod root's `kristal-lib-globals.lua` declares them as globals, with
-  types resolved from each library's `lib.lua` in `libraries/`.
+- Library globals: the mod root's `kristal-lib-globals.lua` declares them as
+  globals, resolved from each library's source. Regenerate it after adding or
+  removing libraries with `sh .emacs/tools/gen-lib-globals.sh`.
 - Assignment type hints, function parameter type hints, and parameter names.
 - Workspace diagnostics on change and four-space formatting.
 
