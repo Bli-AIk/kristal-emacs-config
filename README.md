@@ -188,15 +188,15 @@ Lisp conditions/restarts or resume an interrupted stack frame.
 These bindings exist only while `fumos-mode` or `fumos-repl-mode` owns the
 current buffer:
 
-| Key | Command | Action |
-| --- | --- | --- |
-| `C-x C-e` | `fumos-eval-last-sexp` | Evaluate the expression before point |
-| `C-M-x` | `fumos-eval-defun` | Evaluate the current top-level form |
-| `C-c C-r` | `fumos-eval-region` | Evaluate the active region |
-| `C-c C-b` | `fumos-eval-buffer` | Evaluate the widened buffer |
-| `C-c C-k` | `fumos-reload-current-file` | Semantically reload the saved current source |
-| `C-c C-z` | `fumos-switch-to-repl` | Display the attached game REPL |
-| REPL `C-c C-c` | `fumos-interrupt` | Interrupt the current request through FUMOS |
+| Key            | Command                     | Action                                       |
+| -------------- | --------------------------- | -------------------------------------------- |
+| `C-x C-e`      | `fumos-eval-last-sexp`      | Evaluate the expression before point         |
+| `C-M-x`        | `fumos-eval-defun`          | Evaluate the current top-level form          |
+| `C-c C-r`      | `fumos-eval-region`         | Evaluate the active region                   |
+| `C-c C-b`      | `fumos-eval-buffer`         | Evaluate the widened buffer                  |
+| `C-c C-k`      | `fumos-reload-current-file` | Semantically reload the saved current source |
+| `C-c C-z`      | `fumos-switch-to-repl`      | Display the attached game REPL               |
+| REPL `C-c C-c` | `fumos-interrupt`           | Interrupt the current request through FUMOS  |
 
 ### Doom localleader bindings
 
@@ -206,44 +206,44 @@ replace the displayed `SPC m` prefix with `M-SPC m` in those latter two states.
 The `c`, `e`, `g`, `h`, and `r` prefixes are respectively described by
 which-key as `compile/reload`, `evaluate`, `goto`, `help`, and `repl`.
 
-| Key | Command | Action |
-| --- | --- | --- |
-| `SPC m '` | `fumos-connect-or-switch` | Start if needed, connect, and display the game REPL |
-| `SPC m ;` | `fumos-attach` | Explicitly select and attach an instance |
-| `SPC m m` | `fumos-macroexpand` | Expand the form at point |
-| `SPC m R` | `fumos-reload-game-preserve` | Kristal `Ctrl+R`: quick reload preserving temporary state |
-| `SPC m S` | `fumos-reload-game-save` | Kristal `Ctrl+Shift+R`: reload from the latest save |
-| `SPC m 0` | `fumos-reload-game-from-start` | Kristal `Ctrl+Alt+R`: reload from the beginning |
-| `SPC m c c` | `fumos-reload-current-file` | Reload the current saved file |
-| `SPC m c m` | `fumos-reload-module` | Reload a named Fennel module |
-| `SPC m c f` | `fumos-compile-defun` | Compile the current top-level form |
-| `SPC m c b` | `fumos-compile-buffer` | Compile the in-memory buffer |
-| `SPC m e b` | `fumos-eval-buffer` | Evaluate the buffer |
-| `SPC m e d` | `fumos-eval-defun-overlay` | Evaluate the form with a result overlay |
-| `SPC m e e` | `fumos-eval-last-sexp` | Evaluate the previous expression |
-| `SPC m e E` | `fumos-eval-print-last-sexp` | Evaluate and insert all returned values |
-| `SPC m e f` | `fumos-eval-defun-async` | Queue the top-level form for echo-area output |
-| `SPC m e n` | `fumos-eval-form-and-next` | Evaluate the form and advance |
-| `SPC m e r` | `fumos-eval-region` | Evaluate the region |
-| `SPC m g b` | `xref-go-back` | Return to the previous xref location |
-| `SPC m g d` | `fumos-find-definition` | Find a runtime definition |
-| `SPC m g D` | `fumos-find-definition-other-window` | Find a definition in another window |
-| `SPC m g n` | `fumos-next-error` | Visit the next owned FUMOS error |
-| `SPC m g N` | `fumos-previous-error` | Visit the previous owned FUMOS error |
-| `SPC m h a` | `fumos-apropos` | Search runtime symbols |
-| `SPC m h h` | `fumos-show-documentation` | Show symbol documentation in the game REPL |
-| `SPC m h A` | `fumos-show-arglist` | Show a symbol's argument list |
-| `SPC m h m` | `fumos-macroexpand` | Expand the form at point |
-| `SPC m h l` | `fumos-show-generated-lua` | Show the last generated Lua |
-| `SPC m r a` | `fumos-attach` | Explicitly select and attach an instance |
-| `SPC m r c` | `fumos-clear-repl` | Clear the current game REPL |
-| `SPC m r i` | `fumos-interrupt` | Interrupt the active evaluation |
-| `SPC m r q` | `fumos-disconnect` | Detach without stopping Kristal |
-| `SPC m r r` | `fumos-reconnect` | Reconnect to the same PID |
-| `SPC m r s` | `fumos-switch-to-repl` | Display the game REPL |
-| `SPC m r R` | `fumos-reload-game-preserve` | Reload while preserving temporary state |
-| `SPC m r L` | `fumos-reload-game-save` | Reload from the latest save |
-| `SPC m r 0` | `fumos-reload-game-from-start` | Reload from the beginning |
+| Key         | Command                              | Action                                                    |
+| ----------- | ------------------------------------ | --------------------------------------------------------- |
+| `SPC m '`   | `fumos-connect-or-switch`            | Start if needed, connect, and display the game REPL       |
+| `SPC m ;`   | `fumos-attach`                       | Explicitly select and attach an instance                  |
+| `SPC m m`   | `fumos-macroexpand`                  | Expand the form at point                                  |
+| `SPC m R`   | `fumos-reload-game-preserve`         | Kristal `Ctrl+R`: quick reload preserving temporary state |
+| `SPC m S`   | `fumos-reload-game-save`             | Kristal `Ctrl+Shift+R`: reload from the latest save       |
+| `SPC m 0`   | `fumos-reload-game-from-start`       | Kristal `Ctrl+Alt+R`: reload from the beginning           |
+| `SPC m c c` | `fumos-reload-current-file`          | Reload the current saved file                             |
+| `SPC m c m` | `fumos-reload-module`                | Reload a named Fennel module                              |
+| `SPC m c f` | `fumos-compile-defun`                | Compile the current top-level form                        |
+| `SPC m c b` | `fumos-compile-buffer`               | Compile the in-memory buffer                              |
+| `SPC m e b` | `fumos-eval-buffer`                  | Evaluate the buffer                                       |
+| `SPC m e d` | `fumos-eval-defun-overlay`           | Evaluate the form with a result overlay                   |
+| `SPC m e e` | `fumos-eval-last-sexp`               | Evaluate the previous expression                          |
+| `SPC m e E` | `fumos-eval-print-last-sexp`         | Evaluate and insert all returned values                   |
+| `SPC m e f` | `fumos-eval-defun-async`             | Queue the top-level form for echo-area output             |
+| `SPC m e n` | `fumos-eval-form-and-next`           | Evaluate the form and advance                             |
+| `SPC m e r` | `fumos-eval-region`                  | Evaluate the region                                       |
+| `SPC m g b` | `xref-go-back`                       | Return to the previous xref location                      |
+| `SPC m g d` | `fumos-find-definition`              | Find a runtime definition                                 |
+| `SPC m g D` | `fumos-find-definition-other-window` | Find a definition in another window                       |
+| `SPC m g n` | `fumos-next-error`                   | Visit the next owned FUMOS error                          |
+| `SPC m g N` | `fumos-previous-error`               | Visit the previous owned FUMOS error                      |
+| `SPC m h a` | `fumos-apropos`                      | Search runtime symbols                                    |
+| `SPC m h h` | `fumos-show-documentation`           | Show symbol documentation in the game REPL                |
+| `SPC m h A` | `fumos-show-arglist`                 | Show a symbol's argument list                             |
+| `SPC m h m` | `fumos-macroexpand`                  | Expand the form at point                                  |
+| `SPC m h l` | `fumos-show-generated-lua`           | Show the last generated Lua                               |
+| `SPC m r a` | `fumos-attach`                       | Explicitly select and attach an instance                  |
+| `SPC m r c` | `fumos-clear-repl`                   | Clear the current game REPL                               |
+| `SPC m r i` | `fumos-interrupt`                    | Interrupt the active evaluation                           |
+| `SPC m r q` | `fumos-disconnect`                   | Detach without stopping Kristal                           |
+| `SPC m r r` | `fumos-reconnect`                    | Reconnect to the same PID                                 |
+| `SPC m r s` | `fumos-switch-to-repl`               | Display the game REPL                                     |
+| `SPC m r R` | `fumos-reload-game-preserve`         | Reload while preserving temporary state                   |
+| `SPC m r L` | `fumos-reload-game-save`             | Reload from the latest save                               |
+| `SPC m r 0` | `fumos-reload-game-from-start`       | Reload from the beginning                                 |
 
 These 36 bindings are installed only in `fumos-mode` source buffers. Ordinary
 Fennel projects retain their existing localleader bindings. The one additional
@@ -253,11 +253,11 @@ retains the exact binding it had before FUMOS loaded.
 
 ### Game reload modes
 
-| State source | Wire mode | Command | Doom key |
-| --- | --- | --- | --- |
-| Preserve temporary state | `temp` | `fumos-reload-game-preserve` | `SPC m R` (also `SPC m r R`) |
-| Latest save | `save` | `fumos-reload-game-save` | `SPC m S` (also `SPC m r L`) |
-| Beginning | `none` | `fumos-reload-game-from-start` | `SPC m 0` (also `SPC m r 0`) |
+| State source             | Wire mode | Command                        | Doom key                     |
+| ------------------------ | --------- | ------------------------------ | ---------------------------- |
+| Preserve temporary state | `temp`    | `fumos-reload-game-preserve`   | `SPC m R` (also `SPC m r R`) |
+| Latest save              | `save`    | `fumos-reload-game-save`       | `SPC m S` (also `SPC m r L`) |
+| Beginning                | `none`    | `fumos-reload-game-from-start` | `SPC m 0` (also `SPC m r 0`) |
 
 These editor commands always request FUMOS's in-process
 `Kristal.quickReload` modes. They exactly match Kristal's native `Ctrl+R`,

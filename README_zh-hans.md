@@ -163,15 +163,15 @@ session 并丢失 REPL locals，但游戏状态和已经提交的 live definitio
 
 以下键位只在当前 buffer 由 `fumos-mode` 或 `fumos-repl-mode` 管理时生效：
 
-| 键位 | 命令 | 操作 |
-| --- | --- | --- |
-| `C-x C-e` | `fumos-eval-last-sexp` | 求值 point 前的表达式 |
-| `C-M-x` | `fumos-eval-defun` | 求值当前顶层 form |
-| `C-c C-r` | `fumos-eval-region` | 求值选中 region |
-| `C-c C-b` | `fumos-eval-buffer` | 求值 widen 后的 buffer |
-| `C-c C-k` | `fumos-reload-current-file` | 语义化重载已保存的当前源码 |
-| `C-c C-z` | `fumos-switch-to-repl` | 显示已附着的游戏 REPL |
-| REPL `C-c C-c` | `fumos-interrupt` | 通过 FUMOS 中断当前请求 |
+| 键位           | 命令                        | 操作                       |
+| -------------- | --------------------------- | -------------------------- |
+| `C-x C-e`      | `fumos-eval-last-sexp`      | 求值 point 前的表达式      |
+| `C-M-x`        | `fumos-eval-defun`          | 求值当前顶层 form          |
+| `C-c C-r`      | `fumos-eval-region`         | 求值选中 region            |
+| `C-c C-b`      | `fumos-eval-buffer`         | 求值 widen 后的 buffer     |
+| `C-c C-k`      | `fumos-reload-current-file` | 语义化重载已保存的当前源码 |
+| `C-c C-z`      | `fumos-switch-to-repl`      | 显示已附着的游戏 REPL      |
+| REPL `C-c C-c` | `fumos-interrupt`           | 通过 FUMOS 中断当前请求    |
 
 ### Doom localleader 键位
 
@@ -180,44 +180,44 @@ session 并丢失 REPL locals，但游戏状态和已经提交的 live definitio
 `SPC m` 前缀替换为 `M-SPC m`。which-key 分别把 `c`、`e`、`g`、`h`、`r`
 前缀显示为 `compile/reload`、`evaluate`、`goto`、`help` 和 `repl`。
 
-| 键位 | 命令 | 操作 |
-| --- | --- | --- |
-| `SPC m '` | `fumos-connect-or-switch` | 按需启动、连接并显示游戏 REPL |
-| `SPC m ;` | `fumos-attach` | 显式选择并附着实例 |
-| `SPC m m` | `fumos-macroexpand` | 展开 point 处的 form |
-| `SPC m R` | `fumos-reload-game-preserve` | Kristal `Ctrl+R`：保留临时状态并快速重载 |
-| `SPC m S` | `fumos-reload-game-save` | Kristal `Ctrl+Shift+R`：从最近存档重载 |
-| `SPC m 0` | `fumos-reload-game-from-start` | Kristal `Ctrl+Alt+R`：从头开始重载 |
-| `SPC m c c` | `fumos-reload-current-file` | 重载已保存的当前文件 |
-| `SPC m c m` | `fumos-reload-module` | 重载指定名称的 Fennel module |
-| `SPC m c f` | `fumos-compile-defun` | 编译当前顶层 form |
-| `SPC m c b` | `fumos-compile-buffer` | 编译内存中的 buffer |
-| `SPC m e b` | `fumos-eval-buffer` | 求值 buffer |
-| `SPC m e d` | `fumos-eval-defun-overlay` | 求值 form 并显示结果 overlay |
-| `SPC m e e` | `fumos-eval-last-sexp` | 求值前一个表达式 |
-| `SPC m e E` | `fumos-eval-print-last-sexp` | 求值并插入全部返回值 |
-| `SPC m e f` | `fumos-eval-defun-async` | 将顶层 form 加入 echo-area 输出队列 |
-| `SPC m e n` | `fumos-eval-form-and-next` | 求值当前 form 并移动到下一个 |
-| `SPC m e r` | `fumos-eval-region` | 求值 region |
-| `SPC m g b` | `xref-go-back` | 返回上一个 xref 位置 |
-| `SPC m g d` | `fumos-find-definition` | 查找运行时 definition |
-| `SPC m g D` | `fumos-find-definition-other-window` | 在其他窗口查找 definition |
-| `SPC m g n` | `fumos-next-error` | 访问下一个归属当前连接的 FUMOS 错误 |
-| `SPC m g N` | `fumos-previous-error` | 访问上一个归属当前连接的 FUMOS 错误 |
-| `SPC m h a` | `fumos-apropos` | 搜索运行时符号 |
-| `SPC m h h` | `fumos-show-documentation` | 在游戏 REPL 显示符号文档 |
-| `SPC m h A` | `fumos-show-arglist` | 显示符号参数列表 |
-| `SPC m h m` | `fumos-macroexpand` | 展开 point 处的 form |
-| `SPC m h l` | `fumos-show-generated-lua` | 显示最近生成的 Lua |
-| `SPC m r a` | `fumos-attach` | 显式选择并附着实例 |
-| `SPC m r c` | `fumos-clear-repl` | 清空当前游戏 REPL |
-| `SPC m r i` | `fumos-interrupt` | 中断当前求值 |
-| `SPC m r q` | `fumos-disconnect` | 断开连接但不停止 Kristal |
-| `SPC m r r` | `fumos-reconnect` | 重新连接同一 PID |
-| `SPC m r s` | `fumos-switch-to-repl` | 显示游戏 REPL |
-| `SPC m r R` | `fumos-reload-game-preserve` | 保留临时状态并重载 |
-| `SPC m r L` | `fumos-reload-game-save` | 从最近存档重载 |
-| `SPC m r 0` | `fumos-reload-game-from-start` | 从游戏开头重载 |
+| 键位        | 命令                                 | 操作                                     |
+| ----------- | ------------------------------------ | ---------------------------------------- |
+| `SPC m '`   | `fumos-connect-or-switch`            | 按需启动、连接并显示游戏 REPL            |
+| `SPC m ;`   | `fumos-attach`                       | 显式选择并附着实例                       |
+| `SPC m m`   | `fumos-macroexpand`                  | 展开 point 处的 form                     |
+| `SPC m R`   | `fumos-reload-game-preserve`         | Kristal `Ctrl+R`：保留临时状态并快速重载 |
+| `SPC m S`   | `fumos-reload-game-save`             | Kristal `Ctrl+Shift+R`：从最近存档重载   |
+| `SPC m 0`   | `fumos-reload-game-from-start`       | Kristal `Ctrl+Alt+R`：从头开始重载       |
+| `SPC m c c` | `fumos-reload-current-file`          | 重载已保存的当前文件                     |
+| `SPC m c m` | `fumos-reload-module`                | 重载指定名称的 Fennel module             |
+| `SPC m c f` | `fumos-compile-defun`                | 编译当前顶层 form                        |
+| `SPC m c b` | `fumos-compile-buffer`               | 编译内存中的 buffer                      |
+| `SPC m e b` | `fumos-eval-buffer`                  | 求值 buffer                              |
+| `SPC m e d` | `fumos-eval-defun-overlay`           | 求值 form 并显示结果 overlay             |
+| `SPC m e e` | `fumos-eval-last-sexp`               | 求值前一个表达式                         |
+| `SPC m e E` | `fumos-eval-print-last-sexp`         | 求值并插入全部返回值                     |
+| `SPC m e f` | `fumos-eval-defun-async`             | 将顶层 form 加入 echo-area 输出队列      |
+| `SPC m e n` | `fumos-eval-form-and-next`           | 求值当前 form 并移动到下一个             |
+| `SPC m e r` | `fumos-eval-region`                  | 求值 region                              |
+| `SPC m g b` | `xref-go-back`                       | 返回上一个 xref 位置                     |
+| `SPC m g d` | `fumos-find-definition`              | 查找运行时 definition                    |
+| `SPC m g D` | `fumos-find-definition-other-window` | 在其他窗口查找 definition                |
+| `SPC m g n` | `fumos-next-error`                   | 访问下一个归属当前连接的 FUMOS 错误      |
+| `SPC m g N` | `fumos-previous-error`               | 访问上一个归属当前连接的 FUMOS 错误      |
+| `SPC m h a` | `fumos-apropos`                      | 搜索运行时符号                           |
+| `SPC m h h` | `fumos-show-documentation`           | 在游戏 REPL 显示符号文档                 |
+| `SPC m h A` | `fumos-show-arglist`                 | 显示符号参数列表                         |
+| `SPC m h m` | `fumos-macroexpand`                  | 展开 point 处的 form                     |
+| `SPC m h l` | `fumos-show-generated-lua`           | 显示最近生成的 Lua                       |
+| `SPC m r a` | `fumos-attach`                       | 显式选择并附着实例                       |
+| `SPC m r c` | `fumos-clear-repl`                   | 清空当前游戏 REPL                        |
+| `SPC m r i` | `fumos-interrupt`                    | 中断当前求值                             |
+| `SPC m r q` | `fumos-disconnect`                   | 断开连接但不停止 Kristal                 |
+| `SPC m r r` | `fumos-reconnect`                    | 重新连接同一 PID                         |
+| `SPC m r s` | `fumos-switch-to-repl`               | 显示游戏 REPL                            |
+| `SPC m r R` | `fumos-reload-game-preserve`         | 保留临时状态并重载                       |
+| `SPC m r L` | `fumos-reload-game-save`             | 从最近存档重载                           |
+| `SPC m r 0` | `fumos-reload-game-from-start`       | 从游戏开头重载                           |
 
 这 36 个键位只安装到 `fumos-mode` 源码 buffer。普通 Fennel 项目保留原有
 localleader。额外的 REPL context 键位 `SPC m r i`（或 `M-SPC m r i`）只安装到
@@ -226,11 +226,11 @@ FUMOS 加载前同键的精确 binding identity。
 
 ### 游戏重载模式
 
-| 状态来源 | Wire mode | 命令 | Doom 键位 |
-| --- | --- | --- | --- |
-| 保留临时状态 | `temp` | `fumos-reload-game-preserve` | `SPC m R`（另有 `SPC m r R`） |
-| 最近存档 | `save` | `fumos-reload-game-save` | `SPC m S`（另有 `SPC m r L`） |
-| 从头开始 | `none` | `fumos-reload-game-from-start` | `SPC m 0`（另有 `SPC m r 0`） |
+| 状态来源     | Wire mode | 命令                           | Doom 键位                     |
+| ------------ | --------- | ------------------------------ | ----------------------------- |
+| 保留临时状态 | `temp`    | `fumos-reload-game-preserve`   | `SPC m R`（另有 `SPC m r R`） |
+| 最近存档     | `save`    | `fumos-reload-game-save`       | `SPC m S`（另有 `SPC m r L`） |
+| 从头开始     | `none`    | `fumos-reload-game-from-start` | `SPC m 0`（另有 `SPC m r 0`） |
 
 这些编辑器命令始终通过 FUMOS 请求同一进程内的 `Kristal.quickReload` 模式。只有
 Mod 设置 `hardReset=false` 时，它们才与 Kristal 原生 `Ctrl+R`、
