@@ -29,6 +29,7 @@
             "~/Projects/LuaProjects/Kristal/src"
         ],
         "checkThirdParty": "Disable",
+        "ignoreSubmodules": false,
         "ignoreDir": [
             "assets",
             ".build",
