@@ -8,24 +8,14 @@ errors back to the originating `.fnl` source.
 
 FUMOS stands for **Fumos Updates Mod Objects with S-expressions**.
 
-## Branches
+`main` is the only maintained branch; the former `stable/lua` and
+`experimental/fumos` lines are retired because they were strict subsets of
+`main` (main's Lua support does not require loading the optional FUMOS
+tooling). Parent mods pin `.emacs` to `main`:
 
-This repository maintains three intended configuration lines:
-
-- \`main\`: the current integration line for shared Lua/Kristal support and
-  optional FUMOS tooling.
-- \`stable/lua\`: the minimal Lua-only baseline for standard Kristal templates.
-- \`experimental/fumos\`: the FUMOS FLY workflow, Fennel tooling, and live
-  in-game REPL integration.
-
-Parent mods should pin the line they need instead of following an implicit
-submodule checkout:
-
-\`\`\`sh
-git submodule set-branch --branch stable/lua .emacs
-# or, for a FUMOS project:
-git submodule set-branch --branch experimental/fumos .emacs
-\`\`\`
+```sh
+git submodule set-branch --branch main .emacs
+```
 
 ## Support boundary and requirements
 

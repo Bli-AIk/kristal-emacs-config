@@ -6,20 +6,12 @@ REPL，显式求值和重载、检查 Lisp 数据，并把错误导航回原始 
 
 FUMOS 全称为 **Fumos Updates Mod Objects with S-expressions**。
 
-## 分支
-
-本仓库维护三条有明确用途的配置线：
-
-- \`main\`：共享 Lua/Kristal 支持和可选 FUMOS 工具的当前集成线。
-- \`stable/lua\`：标准 Kristal 模板使用的最小 Lua 基线。
-- \`experimental/fumos\`：FUMOS FLY 工作流、Fennel 工具和游戏内 live REPL。
-
-父 Mod 应显式固定所需分支，不要依赖未声明的子模块 checkout：
+\`main\` 是唯一维护的分支；原 \`stable/lua\` 与 \`experimental/fumos\` 已退役
+（它们都是 main 的严格子集——main 的 Lua 支持不依赖加载可选的 FUMOS 工具）。
+父 Mod 将 \`.emacs\` 固定到 \`main\`：
 
 \`\`\`sh
-git submodule set-branch --branch stable/lua .emacs
-# 或者，在 FUMOS 项目中使用：
-git submodule set-branch --branch experimental/fumos .emacs
+git submodule set-branch --branch main .emacs
 \`\`\`
 
 ## 支持边界与依赖
